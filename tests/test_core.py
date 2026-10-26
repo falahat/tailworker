@@ -22,9 +22,7 @@ loader.exec_module(tw)
 
 class Core(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
 
     def test_input_identity_ignores_times_and_roundtrips_three_files(self):
         source = self.root / 'source'

@@ -16,14 +16,13 @@ PUBLIC = 'ssh-ed25519 ' + base64.b64encode(b'\0\0\0\x0bssh-ed25519\0\0\0\x20' + 
 
 class Cloud(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.addCleanup(mock.patch.stopall)
         mock.patch.object(tw, 'CONFIG', self.root).start()
         self.calls, self.requests, self.created, self.existing = [], [], False, []
         (self.root / 'pub').write_text(PUBLIC)
         tw.save(self.root / 'tailscale-oauth.json', json.dumps(dict(client_id='fixture-id', client_secret='fixture-secret')))
+        tw.save(self.root / 'github-token', 'fixtureGithubToken')
         self.config = dict(owned=dict(control='local'), ssh=dict(public_keys=[str(self.root / 'pub')]),
             gcp=dict(project='fixture-project', zone='fixture-zone', machine_type='fixture-machine',
                      image_family='fixture-cpu', image_project='fixture-images', gpu_image_family='fixture-gpu', gpu_image_project='fixture-images'))
@@ -35,28 +34,31 @@ class Cloud(unittest.TestCase):
         mock.patch.object(tw.urllib.request, 'urlopen', side_effect=self.request).start()
 
     def request(self, request):
-        if isinstance(request, str):
-            return io.BytesIO(json.dumps(dict(ssh_keys=[PUBLIC])).encode())
         self.requests.append(request)
-        response = dict(access_token='fixture-token') if request.full_url.endswith('/oauth/token') else dict(key='tskey-auth-fixture-join')
-        return io.BytesIO(json.dumps(response).encode())
+        value = {
+            'https://api.tailscale.com/api/v2/oauth/token': dict(access_token='fixture-token'),
+            'https://api.tailscale.com/api/v2/tailnet/-/keys': dict(key='tskey-auth-fixture-join'),
+            'https://api.github.com/meta': dict(ssh_keys=[PUBLIC]),
+            'https://api.github.com/repos/owner/repo/keys': dict(id=10),
+            'https://api.github.com/repos/owner/repo/keys?per_page=100': [dict(id=11, title='tw-probe-other')],
+            'https://api.github.com/repos/owner/repo/keys?page=2': [dict(id=10, title='tw-probe')],
+            'https://api.github.com/repos/owner/repo/keys/10': None,
+        }[request.full_url]
+        response = io.BytesIO(b'' if value is None else json.dumps(value).encode())
+        response.status = 204 if value is None else 200
+        response.headers = {'Link': '<https://api.github.com/repos/owner/repo/keys?page=2>; rel="next"'} if 'per_page=100' in request.full_url else {}
+        return response
 
     def output(self, command, **options):
         self.calls.append((command, options))
-        if command[0] == 'git':
-            return 'a' * 40
-        if command[0] == 'gcloud':
-            return json.dumps(self.existing).encode()
-        if command[0] == 'ssh-keyscan':
-            return '100.64.0.3 ' + PUBLIC + '\n'
         if command[0] == 'tailscale':
             peer = dict(ID='new', HostName='tw-probe', Online=True, Tags=['tag:tw', 'tag:tw-app-runner'], TailscaleIPs=['100.64.0.3'])
             return json.dumps(dict(Self=dict(ID='owner', HostName='control', TailscaleIPs=['100.64.0.1']), Peer={'new': peer} if self.created else {}))
-        if command[0] == 'ssh':
-            return (json.dumps(dict(repo='owner/repo', public=PUBLIC)) + '\n').encode()
-        if command[0] == 'gh':
-            return 'owner/repo\n' if 'user/repos' in command else '\n'.join(json.dumps(value) for value in ([10, 'tw-probe'], [11, 'tw-probe-other'], [12, 'other']))
-        raise AssertionError(command[0])
+        return {
+            'git': 'a' * 40, 'gcloud': json.dumps(self.existing).encode(),
+            'ssh-keyscan': '100.64.0.3 ' + PUBLIC + '\n',
+            'ssh': (json.dumps(dict(repo='owner/repo', public=PUBLIC)) + '\n').encode(),
+        }[command[0]]
 
     def sdk_run(self, command, **options):
         self.calls.append((command, options))
@@ -78,12 +80,12 @@ class Cloud(unittest.TestCase):
         minted = json.loads(self.requests[1].data)
         self.assertEqual(minted['expirySeconds'], 900)
         self.assertEqual(minted['capabilities']['devices']['create'], dict(reusable=False, ephemeral=True, preauthorized=True, tags=['tag:tw', 'tag:tw-app-runner']))
-        for secret in ('fixture-secret', 'fixture-token', 'tskey-auth-fixture-join'):
+        for secret in ('fixture-secret', 'fixture-token', 'tskey-auth-fixture-join', 'fixtureGithubToken'):
             self.assertNotIn(secret, repr(self.calls) + captured.getvalue())
         self.assertTrue(all(not path.exists() for path in self.temporary_files))
-        addition = next((command, value) for command, value in self.calls if command[:3] == ['gh', 'repo', 'deploy-key'])
-        self.assertNotIn('--allow-write', addition[0])
-        self.assertEqual(addition[1]['input'], (PUBLIC + '\n').encode())
+        addition = next(request for request in self.requests if request.full_url.endswith('/repos/owner/repo/keys'))
+        self.assertTrue(json.loads(addition.data)['read_only'])
+        self.assertEqual(json.loads(addition.data)['key'], PUBLIC)
 
     def test_bounds_existing_instance_dry_run_and_name_collision(self):
         for hours in (0, 25):
@@ -105,12 +107,12 @@ class Cloud(unittest.TestCase):
             tw.up(self.args, self.config)
 
     def test_down_scopes_keys_and_does_not_accept_an_offline_peer(self):
-        self.existing = [dict(name='tw-probe', labels=dict(tailworker='1'), zone='zones/fixture-zone')]
+        self.existing = [dict(name='tw-probe', labels=dict(tailworker='1'), zone='zones/fixture-zone', metadata=dict(items=[dict(key='tw-deploy-repos', value='owner/repo')]))]
         with mock.patch.object(tw, 'nodes', return_value=[dict(HostName='tw-probe', Online=False)]):
             with self.assertRaisesRegex(ValueError, 'cleanup is incomplete'):
                 tw.down(self.args, self.config)
-        deletions = [command for command, _ in self.calls if command[0] == 'gh' and 'DELETE' in command]
-        self.assertEqual([command[-1] for command in deletions], ['repos/owner/repo/keys/10'])
+        deletions = [request.full_url for request in self.requests if request.get_method() == 'DELETE']
+        self.assertEqual(deletions, ['https://api.github.com/repos/owner/repo/keys/10'])
         self.assertEqual([command[0] for command, _ in self.calls if 'delete' in command or command[0] == 'ssh'], ['gcloud'])
 
     def test_stale_or_wrongly_tagged_peer_never_establishes_a_pin(self):

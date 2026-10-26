@@ -81,10 +81,8 @@ def setup():
              'machine_type = ""\nimage_family = ""\nimage_project = ""\n'
              'gpu_image_family = ""\ngpu_image_project = ""\n\n'
              '[ssh]\npublic_keys = []\npty_public_key = ""\n')
-    if settings()['gcp']['project']:
-        for tool in ('gcloud', 'gh'):
-            if not shutil.which(tool):
-                raise ValueError('install ' + tool + ' before cloud setup')
+    if settings()['gcp']['project'] and not shutil.which('gcloud'):
+        raise ValueError('install gcloud before cloud setup')
     if not (CONFIG / 'tailscale-oauth.json').exists():
         client = getpass.getpass('Tailscale OAuth client id (blank to defer cloud setup): ')
         if client:
@@ -316,31 +314,47 @@ def image_send(args):
     if existing == identifier:
         print('image cached=' + identifier)
         return
-    if machine['host'] == 'local' and not args.from_docker:
-        return
     pipe(source + ['save', args.image], command(machine['host'], ['bash', '-o', 'pipefail', '-c', 'zstd -q -d -c | podman load']))
     if output(machine['host'], ['podman', 'image', 'inspect', '--format', '{{.Id}}', args.image]).removeprefix('sha256:') != identifier:
         raise ValueError('transferred image identity differs')
 
 
-def api(url, value, token=None, form=False):
-    body = urllib.parse.urlencode(value).encode() if form else json.dumps(value).encode()
-    headers = {'Content-Type': 'application/x-www-form-urlencoded' if form else 'application/json'}
+def api(url, value=None, token=None, form=False, method=None):
+    body = (urllib.parse.urlencode(value).encode() if form else json.dumps(value).encode()) if value is not None else None
+    headers = {'Content-Type': 'application/x-www-form-urlencoded' if form else 'application/json', 'User-Agent': 'tailworker'}
     if token:
         headers['Authorization'] = 'Bearer ' + token
+    origin, result = urllib.parse.urlsplit(url)[:2], []
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, data=body, headers=headers)) as response:
-            return json.load(response)
+        while True:
+            with urllib.request.urlopen(urllib.request.Request(url, data=body, headers=headers, method=method)) as response:
+                value = None if response.status == 204 else json.load(response)
+                if not isinstance(value, list):
+                    return value
+                result.extend(value)
+                link = re.search(r'<([^>]+)>;\s*rel="next"', response.headers.get('Link', ''))
+                if not link:
+                    return result
+                url = link.group(1)
+                if urllib.parse.urlsplit(url)[:2] != origin:
+                    raise ValueError('provider pagination changed origin')
     except urllib.error.HTTPError as error:
         raise ValueError('provider request failed with HTTP ' + str(error.code)) from None
 
 
-def join_key(tags):
-    path = CONFIG / 'tailscale-oauth.json'
+def private(name, token=False):
+    path = CONFIG / name
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise ValueError('OAuth credentials require an owned private regular file')
-    credentials = json.loads(path.read_text())
+        raise ValueError('credentials require an owned private regular file')
+    value = path.read_text().strip()
+    if token and not re.fullmatch(r'[A-Za-z0-9_]+', value):
+        raise ValueError('token file must contain one plain token')
+    return value
+
+
+def join_key(tags):
+    credentials = json.loads(private('tailscale-oauth.json'))
     token = api('https://api.tailscale.com/api/v2/oauth/token',
                 dict(grant_type='client_credentials', **credentials), form=True)['access_token']
     return api('https://api.tailscale.com/api/v2/tailnet/-/keys', dict(expirySeconds=900,
@@ -391,8 +405,8 @@ for path in (folder/'ssh/config',folder/'ssh/known_hosts',folder/'gitconfig'):pa
 def deploy_keys(alias, args):
     if not args.deploy_key:
         return
-    with urllib.request.urlopen('https://api.github.com/meta') as response:
-        host_keys = json.load(response)['ssh_keys']
+    token = private('github-token', token=True)
+    host_keys = api('https://api.github.com/meta')['ssh_keys']
     value = dict(repos=args.deploy_key, directory=args.deploy_dir, base=args.deploy_base, host_keys=host_keys)
     result = subprocess.check_output(command(alias, ['python3', '-c', DEPLOY]), input=json.dumps(value).encode())
     returned = [json.loads(line) for line in result.decode().splitlines()]
@@ -401,8 +415,7 @@ def deploy_keys(alias, args):
     for key in returned:
         if not re.fullmatch(r'ssh-ed25519 [A-Za-z0-9+/]+={0,3}(?: [^\r\n]*)?', key['public']):
             raise ValueError('worker returned an invalid public deploy key')
-        subprocess.run(['gh', 'repo', 'deploy-key', 'add', '-', '--repo', key['repo'], '--title', alias],
-                       input=(key['public'] + '\n').encode(), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        api('https://api.github.com/repos/' + key['repo'] + '/keys', dict(title=alias, key=key['public'], read_only=True), token)
 
 
 def up(args, config):
@@ -444,7 +457,7 @@ def up(args, config):
             '--instance-termination-action=DELETE', '--image-family=' + cloud[family], '--image-project=' + cloud[project],
             '--boot-disk-size=' + str(args.disk_gb), '--labels=tailworker=1',
             '--metadata=block-project-ssh-keys=TRUE,enable-oslogin=FALSE,tw-name=' + alias + ',tw-tags=' + ' '.join(tags) +
-            ',tw-allow=' + ' '.join(allowed) + ',tw-expires-at=' + expires,
+            ',tw-allow=' + ' '.join(allowed) + ',tw-expires-at=' + expires + ',tw-deploy-repos=' + ' '.join(args.deploy_key),
             '--metadata-from-file=startup-script=' + str(startup) + ',tw-authkey=' + str(auth) + ',tw-authorized-keys=' + str(keys))
         if args.spot:
             creation.append('--provisioning-model=SPOT')
@@ -453,6 +466,8 @@ def up(args, config):
         if args.dry_run:
             print(shlex.join(creation))
             return
+        if args.deploy_key:
+            private('github-token', token=True)
         call('local', ['git', '-C', str(Path(__file__).resolve().parent), 'diff', '--quiet', 'HEAD'])
         if json.loads(subprocess.check_output(gcloud(config, 'instances', 'list', '--filter=labels.tailworker=1', '--format=json'))):
             raise ValueError('a labelled worker instance already exists; inspect it first')
@@ -511,25 +526,22 @@ def down(args, config):
     if any(item['name'] != alias or item.get('labels', {}).get('tailworker') != '1' for item in instances):
         raise ValueError('refusing to remove an instance not owned by tailworker')
     # The root shutdown unit logs out; the job account never administers tailscaled.
-    steps = []
     try:
-        repos = subprocess.check_output(['gh', 'api', 'user/repos', '--paginate', '--jq', '.[] | select(.permissions.admin) | .full_name'], text=True).splitlines()
-    except subprocess.CalledProcessError:
-        repos, failed = [], True
-        print('Could not discover deploy keys; continuing VM cleanup', file=sys.stderr)
-    for repo in repos:
-        try:
-            rows = subprocess.check_output(['gh', 'api', 'repos/' + repo + '/keys', '--paginate', '--jq', '.[] | [.id,.title] | @json'], text=True).splitlines()
-        except subprocess.CalledProcessError:
-            failed = True
-            print('Could not inspect deploy keys for ' + repo, file=sys.stderr)
-            continue
-        for row in rows:
-            identifier, title = json.loads(row)
-            if title == alias:
-                steps.append(['gh', 'api', '--method', 'DELETE', 'repos/' + repo + '/keys/' + str(int(identifier))])
-    steps += [gcloud(config, 'instances', 'delete', alias, '--zone=' + item['zone'].rsplit('/', 1)[-1]) for item in instances]
-    for step in steps:
+        metadata = {entry['key']: entry['value'] for item in instances for entry in item.get('metadata', {}).get('items', [])}
+        repositories = metadata['tw-deploy-repos'].split()
+        if repositories:
+            token = private('github-token', token=True)
+            for repo in repositories:
+                if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
+                    raise ValueError('invalid repository identity')
+                for key in api('https://api.github.com/repos/' + repo + '/keys?per_page=100', token=token):
+                    if key['title'] == alias:
+                        api('https://api.github.com/repos/' + repo + '/keys/' + str(int(key['id'])), token=token, method='DELETE')
+    except (OSError, ValueError, KeyError, AttributeError, TypeError):
+        failed = True
+        print(alias + ' deploy-key cleanup authority is unverified; continuing VM cleanup', file=sys.stderr)
+    for item in instances:
+        step = gcloud(config, 'instances', 'delete', alias, '--zone=' + item['zone'].rsplit('/', 1)[-1])
         result = subprocess.run(step, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if result.returncode:
             print('Cleanup failed: ' + shlex.join(step), file=sys.stderr)

@@ -80,7 +80,7 @@ tests. Create an OAuth client scoped to auth-key writes for the worker tags,
 then run `tailworker setup` on the control host and enter its credentials at
 the masked prompts. In the Google project, prepare the `tailworker` network,
 subnet and outbound Cloud NAT, with no inbound firewall rules. Install and
-authenticate `gcloud` and `gh` on the control host. Fill `[gcp]` in config.toml:
+authenticate `gcloud` on the control host. No GitHub CLI is required. Fill `[gcp]` in config.toml:
 project, zone, region, machine type and CPU/GPU image family/project. Images
 must be apt-based Ubuntu or Debian; GPU images must already include drivers.
 
@@ -117,19 +117,38 @@ tags and a different bootstrap revision fail. Startup resumes its persisted
 tailnet identity on reboot and logs out at shutdown.
 
 Repeat `--deploy-key OWNER/REPO` to generate private keys on the worker and
-register only their public halves read-only through the owner's `gh` login.
+register only their public halves read-only through GitHub's HTTPS REST API.
+Only this optional automation needs an owner API token. Save one plain token
+in the control host's `~/.config/tailworker/github-token` (or the corresponding
+XDG config directory), owned by the caller with mode 0600. Create/edit the file
+privately outside Git; never put its value in argv, environment or a job.
+A fine-grained personal token needs repository Administration (write), which
+includes the read permission to list keys, for only the repositories supplied
+to `--deploy-key`; Metadata (read) is implicit. See
+[GitHub's deploy-key permissions](https://docs.github.com/en/rest/deploy-keys/deploy-keys).
+The token stays on the control host and never reaches a worker. Ordinary jobs
+and public-dependency workers need no GitHub administration credential. Private
+fetch credentials can also be provisioned separately, with the public key
+registered manually in the provider's browser UI, without this API automation.
+Read-only source tokens belong to the consuming project's fetch secrets and
+are separate from this optional Administration token. A source token cannot
+perform these deploy-key administration operations.
 `--deploy-dir` selects their private directory and `--deploy-base` selects the
 paths consumers see inside their secret mount; for example, ci-buddy uses
 `.ci-buddy/projects/<project>/secrets` and `/run/secrets`. GitHub host keys come
 from its HTTPS metadata API. Private halves stay on the worker.
 
-`down` removes only deploy keys with the exact `tw-NAME` title across the
-owner's administered repositories and deletes the labelled VM. Its root
+`down` removes only deploy keys with the exact `tw-NAME` title in the explicit
+`tw-deploy-repos` repository scope recorded by `up`, and deletes the labelled VM. Its root
 shutdown unit logs out; the job account has no Tailscale administration.
 The control host must observe the named node absent before cleanup succeeds
-and its alias is removed; an offline node still counts as present. It also
-removes leftover deploy keys after automatic expiry. Failed cleanup names
-what remains; no action is retried. VM deletion at the hard lifetime is
+and its alias is removed; an offline node still counts as present. A recorded
+empty repository scope needs no GitHub credential. Key lists follow GitHub's
+[native pagination links](https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api).
+Missing scope, an expired VM whose metadata is gone, or inadequate API authority
+leaves key cleanup explicitly unverified; no account-wide discovery or deletion
+is attempted. The owned VM is still deleted, and the owner checks any remaining
+keys manually. Failed cleanup names what remains; no action is retried. VM deletion at the hard lifetime is
 enforced by the provider. Creation failures leave the
 possible VM for explicit owner inspection rather than guessing and deleting it.
 
