@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -108,6 +109,29 @@ class Core(unittest.TestCase):
         pipe.assert_not_called()
         self.assertRegex(path, r'/inputs/[0-9a-f]{64}$')
         call.assert_called_once_with('local', ['touch', path])
+
+    def test_pruning_removes_old_inputs_but_keeps_active_mounts_and_fresh_inputs(self):
+        cache = self.root / 'tailworker' / 'inputs'
+        old, active, fresh = [cache / (letter * 64) for letter in 'abc']
+        for directory in (old, active, fresh):
+            directory.mkdir(parents=True)
+            (directory / 'input').write_text('data')
+        expired = time.time() - 8 * 86400
+        for directory in (old, active):
+            os.utime(directory, (expired, expired))
+        binary = self.root / 'bin'
+        binary.mkdir()
+        podman = binary / 'podman'
+        podman.write_text('#!' + sys.executable + '\nimport json,sys\n'
+                          'print("container" if sys.argv[1]=="ps" else json.dumps('
+                          + repr([dict(Mounts=[dict(Source=str(active))])]) + '))\n')
+        podman.chmod(0o700)
+        environment = dict(os.environ, XDG_CACHE_HOME=str(self.root),
+                           PATH=str(binary) + os.pathsep + os.environ['PATH'])
+        subprocess.run([sys.executable, '-c', tw.PRUNE], env=environment, check=True)
+        self.assertFalse(old.exists())
+        self.assertTrue((active / 'input').is_file())
+        self.assertTrue((fresh / 'input').is_file())
 
     def test_offline_run_uses_memory_cap_and_never_pulls(self):
         args = argparse.Namespace(on=None, gpu=False, image='image', inputs=None, out=None,
