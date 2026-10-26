@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Private machines and one-off rootless container jobs; no queue or scheduler."""
 import argparse
+import base64
+from datetime import datetime, timedelta, timezone
+import fcntl
 import getpass
 import hashlib
 import io
@@ -12,11 +15,16 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 
 HOME = Path.home()
@@ -72,7 +80,7 @@ def setup():
              '[gcp]\nproject = ""\nzone = ""\nregion = ""\n'
              'machine_type = ""\nimage_family = ""\nimage_project = ""\n'
              'gpu_image_family = ""\ngpu_image_project = ""\n\n'
-             '[ssh]\npublic_keys = []\n')
+             '[ssh]\npublic_keys = []\npty_public_key = ""\n')
     if settings()['gcp']['project']:
         for tool in ('gcloud', 'gh'):
             if not shutil.which(tool):
@@ -97,10 +105,7 @@ def machines(config):
         name = node['HostName'].removeprefix('tw-')
         if not re.fullmatch(r'[a-z][a-z0-9-]*', name):
             raise ValueError('invalid dedicated worker name')
-        address = ipaddress.ip_address(node['TailscaleIPs'][0])
-        if address not in ipaddress.ip_network('100.64.0.0/10') and address not in ipaddress.ip_network('fd7a:115c:a1e0::/48'):
-            raise ValueError('dedicated worker has no tailnet address')
-        result.append(dict(name=name, host='tw-' + name, kind='dedicated', online=node['Online'], ip=str(address)))
+        result.append(dict(name=name, host='tw-' + name, kind='dedicated', online=node['Online'], ip=tailnet_address(node)))
     return result
 
 
@@ -318,6 +323,233 @@ def image_send(args):
         raise ValueError('transferred image identity differs')
 
 
+def api(url, value, token=None, form=False):
+    body = urllib.parse.urlencode(value).encode() if form else json.dumps(value).encode()
+    headers = {'Content-Type': 'application/x-www-form-urlencoded' if form else 'application/json'}
+    if token:
+        headers['Authorization'] = 'Bearer ' + token
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=body, headers=headers)) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        raise ValueError('provider request failed with HTTP ' + str(error.code)) from None
+
+
+def join_key(tags):
+    path = CONFIG / 'tailscale-oauth.json'
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError('OAuth credentials require an owned private regular file')
+    credentials = json.loads(path.read_text())
+    token = api('https://api.tailscale.com/api/v2/oauth/token',
+                dict(grant_type='client_credentials', **credentials), form=True)['access_token']
+    return api('https://api.tailscale.com/api/v2/tailnet/-/keys', dict(expirySeconds=900,
+               capabilities=dict(devices=dict(create=dict(reusable=False, ephemeral=True,
+                                                          preauthorized=True, tags=tags)))), token)['key']
+
+
+def nodes():
+    state = json.loads(subprocess.check_output(['tailscale', 'status', '--json'], text=True))
+    return [state['Self'], *state.get('Peer', {}).values()]
+
+
+def tailnet_address(node):
+    address = ipaddress.ip_address(node['TailscaleIPs'][0])
+    if address not in ipaddress.ip_network('100.64.0.0/10') and address not in ipaddress.ip_network('fd7a:115c:a1e0::/48'):
+        raise ValueError('dedicated worker has no tailnet address')
+    return str(address)
+
+
+def gcloud(config, *arguments):
+    return ['gcloud', '--quiet', '--project=' + config['gcp']['project'], 'compute', *arguments]
+
+
+DEPLOY = '''import hashlib,json,pathlib,shlex,subprocess,sys
+value=json.load(sys.stdin)
+folder=pathlib.Path(value['directory']).expanduser()
+folder.mkdir(mode=0o700,parents=True,exist_ok=True)
+folder.chmod(0o700)
+(folder/'ssh').mkdir(mode=0o700,exist_ok=True)
+base=value['base'] or str(folder)
+blocks=[]
+rewrites=['[core]\\n sshCommand = '+json.dumps('ssh -F '+shlex.quote(base+'/ssh/config'))+'\\n']
+for repo in value['repos']:
+    name='key-'+hashlib.sha256(repo.encode()).hexdigest()[:16]
+    key=folder/name
+    subprocess.run(['ssh-keygen','-q','-t','ed25519','-N','','-f',str(key)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    key.chmod(0o600)
+    blocks.append('Host tw-'+name+'\\n HostName github.com\\n User git\\n IdentitiesOnly yes\\n StrictHostKeyChecking yes\\n IdentityFile '+json.dumps(base+'/'+name)+'\\n UserKnownHostsFile '+json.dumps(base+'/ssh/known_hosts')+'\\n')
+    rewrites.append('[url "ssh://git@tw-'+name+'/'+repo+'"]\\n'+''.join(' insteadOf = '+address+repo+'\\n' for address in ('https://github.com/','git@github.com:','ssh://git@github.com/')))
+    print(json.dumps(dict(repo=repo,public=key.with_suffix('.pub').read_text().strip())),flush=True)
+(folder/'ssh/config').write_text(''.join(blocks))
+(folder/'ssh/known_hosts').write_text(''.join('github.com '+key+'\\n' for key in value['host_keys']))
+(folder/'gitconfig').write_text(''.join(rewrites))
+for path in (folder/'ssh/config',folder/'ssh/known_hosts',folder/'gitconfig'):path.chmod(0o600)
+'''
+
+
+def deploy_keys(alias, args):
+    if not args.deploy_key:
+        return
+    with urllib.request.urlopen('https://api.github.com/meta') as response:
+        host_keys = json.load(response)['ssh_keys']
+    value = dict(repos=args.deploy_key, directory=args.deploy_dir, base=args.deploy_base, host_keys=host_keys)
+    result = subprocess.check_output(command(alias, ['python3', '-c', DEPLOY]), input=json.dumps(value).encode())
+    returned = [json.loads(line) for line in result.decode().splitlines()]
+    if [key['repo'] for key in returned] != args.deploy_key:
+        raise ValueError('worker returned unexpected deploy-key identities')
+    for key in returned:
+        if not re.fullmatch(r'ssh-ed25519 [A-Za-z0-9+/]+={0,3}(?: [^\r\n]*)?', key['public']):
+            raise ValueError('worker returned an invalid public deploy key')
+        subprocess.run(['gh', 'repo', 'deploy-key', 'add', '-', '--repo', key['repo'], '--title', alias],
+                       input=(key['public'] + '\n').encode(), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def up(args, config):
+    if not 1 <= args.hours <= 24 or args.disk_gb <= 0 or not re.fullmatch(r'[a-z](?:[a-z0-9-]{0,58}[a-z0-9])?', args.name):
+        raise ValueError('use a valid name and a hard lifetime from 1 through 24 hours')
+    if any(not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo) for repo in args.deploy_key):
+        raise ValueError('deploy keys require OWNER/REPO names')
+    tags = sorted(set(['tag:tw', *args.tag]))
+    if any(not re.fullmatch(r'tag:[a-z0-9-]+', tag) for tag in tags):
+        raise ValueError('provide native worker tags')
+    cloud = config['gcp']
+    family = 'gpu_image_family' if args.gpu else 'image_family'
+    project = 'gpu_image_project' if args.gpu else 'image_project'
+    if not all(cloud.get(key) for key in ('project', 'zone', family, project)) or not (args.machine_type or cloud.get('machine_type')):
+        raise ValueError('fill the cloud project, zone, machine type and image settings first')
+    revision = output('local', ['git', '-C', str(Path(__file__).resolve().parent), 'rev-parse', 'HEAD'])
+    alias = 'tw-' + args.name
+    pins = (CONFIG / 'known_hosts').read_text() if (CONFIG / 'known_hosts').exists() else ''
+    if args.name in config['owned'] or any(line.startswith(alias + ' ') for line in pins.splitlines()):
+        raise ValueError('worker name already has an owned machine or host pin')
+    baseline = [] if args.dry_run and not args.allow else nodes()
+    if any(node['HostName'] in (args.name, alias) for node in baseline):
+        raise ValueError('worker name already belongs to a tailnet node')
+    allowed = []
+    for item in args.allow:
+        host, port = item.rsplit(':', 1)
+        matching = [node for node in baseline if host in (node['HostName'], node.get('DNSName', '').rstrip('.'))]
+        if len(matching) != 1 or not 0 < int(port) < 65536:
+            raise ValueError('allow entries need one existing tailnet host and a TCP port')
+        allowed.append(tailnet_address(matching[0]) + ':' + str(int(port)))
+    expires = (datetime.now(timezone.utc) + timedelta(hours=args.hours)).isoformat()
+    with tempfile.TemporaryDirectory(dir=CONFIG) as temporary:
+        folder = Path(temporary)
+        startup, auth, keys = [folder / name for name in ('startup.sh', 'authkey', 'authorized_keys')]
+        save(startup, Path(__file__).with_name('bootstrap.sh').read_text().replace('@REVISION@', revision))
+        creation = gcloud(config, 'instances', 'create', alias, '--zone=' + cloud['zone'],
+            '--machine-type=' + (args.machine_type or cloud['machine_type']), '--network=tailworker', '--subnet=tailworker',
+            '--no-address', '--no-service-account', '--no-scopes', '--max-run-duration=' + str(args.hours) + 'h',
+            '--instance-termination-action=DELETE', '--image-family=' + cloud[family], '--image-project=' + cloud[project],
+            '--boot-disk-size=' + str(args.disk_gb), '--labels=tailworker=1',
+            '--metadata=block-project-ssh-keys=TRUE,enable-oslogin=FALSE,tw-name=' + alias + ',tw-tags=' + ' '.join(tags) +
+            ',tw-allow=' + ' '.join(allowed) + ',tw-expires-at=' + expires,
+            '--metadata-from-file=startup-script=' + str(startup) + ',tw-authkey=' + str(auth) + ',tw-authorized-keys=' + str(keys))
+        if args.spot:
+            creation.append('--provisioning-model=SPOT')
+        if args.gpu:
+            creation.append('--maintenance-policy=TERMINATE')
+        if args.dry_run:
+            print(shlex.join(creation))
+            return
+        call('local', ['git', '-C', str(Path(__file__).resolve().parent), 'diff', '--quiet', 'HEAD'])
+        if json.loads(subprocess.check_output(gcloud(config, 'instances', 'list', '--filter=labels.tailworker=1', '--format=json'))):
+            raise ValueError('a labelled worker instance already exists; inspect it first')
+        entries = [('restrict', Path(path)) for path in config['ssh']['public_keys']]
+        if config['ssh'].get('pty_public_key'):
+            entries.append(('restrict,pty', Path(config['ssh']['pty_public_key'])))
+        public = [option + ' ' + path.expanduser().read_text().strip() for option, path in entries]
+        if not public or any(not re.fullmatch(r'restrict(?:,pty)? ssh-ed25519 [A-Za-z0-9+/]+={0,3}(?: [^\r\n]*)?', key) for key in public):
+            raise ValueError('configure the approved submitters ed25519 public-key files')
+        save(keys, '\n'.join(public) + '\n')
+        save(auth, join_key(tags))
+        try:
+            subprocess.run(creation, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except BaseException:
+            print(alias + ' may exist and bill until its hard lifetime; inspect it, no creation was retried.', file=sys.stderr)
+            raise
+    old = {node['ID'] for node in baseline}
+    while True:
+        current = nodes()
+        matching = [node for node in current if node['HostName'] == alias]
+        if len(matching) > 1 or any(node['ID'] in old or set(node.get('Tags', [])) != set(tags) for node in matching):
+            raise ValueError('ambiguous, stale or incorrectly tagged worker identity')
+        if matching and matching[0]['Online']:
+            break
+        print('Waiting for ' + alias + ' to join the tailnet', flush=True)
+        time.sleep(1)
+    address = tailnet_address(matching[0])
+    scanned = subprocess.check_output(['ssh-keyscan', '-T', '5', '-t', 'ed25519', address], stderr=subprocess.DEVNULL, text=True)
+    fields = [line.split() for line in scanned.splitlines() if not line.startswith('#')]
+    if len(fields) != 1 or len(fields[0]) != 3 or fields[0][:2] != [address, 'ssh-ed25519']:
+        raise ValueError('invalid initial worker host key')
+    blob = base64.b64decode(fields[0][2], validate=True)
+    if len(blob) != 51 or blob[:19] != b'\0\0\0\x0bssh-ed25519\0\0\0\x20':
+        raise ValueError('invalid initial worker host key')
+    save(CONFIG / 'known_hosts', pins + alias + ' ' + ' '.join(fields[0][1:]) + '\n')
+    aliases(machines(config))
+    while True:
+        ready = subprocess.run(command(alias, ['cat', '/var/lib/tailworker/ready']), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if ready.returncode == 0:
+            if ready.stdout.decode().strip() != revision:
+                raise ValueError('worker bootstrap revision differs from reviewed source')
+            break
+        if ready.returncode != 1:
+            raise ValueError('private worker SSH failed; no command was retried')
+        print('Waiting for ' + alias + ' bootstrap', flush=True)
+        time.sleep(1)
+    deploy_keys(alias, args)
+    print('ssh ' + alias + '; expires ' + expires)
+
+
+def down(args, config):
+    if not re.fullmatch(r'[a-z](?:[a-z0-9-]{0,58}[a-z0-9])?', args.name):
+        raise ValueError('provide a valid worker name')
+    alias, failed = 'tw-' + args.name, False
+    instances = json.loads(subprocess.check_output(gcloud(config, 'instances', 'list', '--filter=name=' + alias, '--format=json')))
+    if any(item['name'] != alias or item.get('labels', {}).get('tailworker') != '1' for item in instances):
+        raise ValueError('refusing to remove an instance not owned by tailworker')
+    # The root shutdown unit logs out; the job account never administers tailscaled.
+    steps = []
+    try:
+        repos = subprocess.check_output(['gh', 'api', 'user/repos', '--paginate', '--jq', '.[] | select(.permissions.admin) | .full_name'], text=True).splitlines()
+    except subprocess.CalledProcessError:
+        repos, failed = [], True
+        print('Could not discover deploy keys; continuing VM cleanup', file=sys.stderr)
+    for repo in repos:
+        try:
+            rows = subprocess.check_output(['gh', 'api', 'repos/' + repo + '/keys', '--paginate', '--jq', '.[] | [.id,.title] | @json'], text=True).splitlines()
+        except subprocess.CalledProcessError:
+            failed = True
+            print('Could not inspect deploy keys for ' + repo, file=sys.stderr)
+            continue
+        for row in rows:
+            identifier, title = json.loads(row)
+            if title == alias:
+                steps.append(['gh', 'api', '--method', 'DELETE', 'repos/' + repo + '/keys/' + str(int(identifier))])
+    steps += [gcloud(config, 'instances', 'delete', alias, '--zone=' + item['zone'].rsplit('/', 1)[-1]) for item in instances]
+    for step in steps:
+        result = subprocess.run(step, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode:
+            print('Cleanup failed: ' + shlex.join(step), file=sys.stderr)
+            failed = True
+    try:
+        absent = not any(node['HostName'] == alias for node in nodes())
+    except subprocess.CalledProcessError:
+        absent = False
+    if not absent:
+        print(alias + ' node removal is not independently confirmed; inspect tailnet status', file=sys.stderr)
+        failed = True
+    if failed:
+        raise ValueError(alias + ' cleanup is incomplete; inspect the instance, node and deploy keys')
+    known = CONFIG / 'known_hosts'
+    pins = known.read_text() if known.exists() else ''
+    save(known, ''.join(line + '\n' for line in pins.splitlines() if not line.startswith(alias + ' ')))
+    aliases(machines(config))
+    print(alias + ' removed; no step was retried')
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
@@ -338,6 +570,19 @@ def main():
     send.add_argument('image')
     send.add_argument('--to', required=True)
     send.add_argument('--from', choices=['docker'], dest='source')
+    create = commands.add_parser('up')
+    create.add_argument('provider', choices=['gcp'])
+    create.add_argument('--name', required=True)
+    create.add_argument('--hours', type=int, required=True)
+    for flag in ('gpu', 'spot', 'dry-run'):
+        create.add_argument('--' + flag, action='store_true')
+    create.add_argument('--machine-type')
+    create.add_argument('--disk-gb', type=int, default=200)
+    for flag in ('tag', 'allow', 'deploy-key'):
+        create.add_argument('--' + flag, action='append', default=[])
+    create.add_argument('--deploy-dir', default='~/.config/tailworker/github')
+    create.add_argument('--deploy-base')
+    commands.add_parser('down').add_argument('name')
     args = parser.parse_args()
     if args.action == 'setup':
         setup()
@@ -346,9 +591,13 @@ def main():
     elif args.action == 'run':
         args.command = args.command[1:] if args.command[:1] == ['--'] else args.command
         return run(args)
-    else:
+    elif args.action == 'image':
         args.from_docker = args.source == 'docker'
         image_send(args)
+    else:
+        with (CONFIG / 'cloud.lock').open('a+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            (up if args.action == 'up' else down)(args, settings())
     return 0
 
 
