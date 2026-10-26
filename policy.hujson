@@ -1,0 +1,30 @@
+{
+  "hosts": {
+    "tw-bigboi": "100.84.95.43",
+    "tw-laptop": "100.74.144.10"
+  },
+  "tagOwners": {
+    "tag:tw": ["aryanfalahat@gmail.com"],
+    "tag:tw-easypod-runner": ["aryanfalahat@gmail.com"],
+    "tag:tw-antibody-runner": ["aryanfalahat@gmail.com"],
+    "tag:easypod-plane": ["aryanfalahat@gmail.com"],
+    "tag:antibody-plane": ["aryanfalahat@gmail.com"]
+  },
+  "grants": [
+    // The control host and the owner's laptop administer workers and push jobs.
+    {"src": ["tw-bigboi", "tw-laptop"], "dst": ["tag:tw"], "ip": ["tcp:22"]},
+    // A plane runner reaches only its own plane's PEP doors.
+    {"src": ["tag:tw-easypod-runner"], "dst": ["tag:easypod-plane"], "ip": ["tcp:7443", "tcp:8443"]},
+    {"src": ["tag:tw-antibody-runner"], "dst": ["tag:antibody-plane"], "ip": ["tcp:7443", "tcp:8443"]},
+    // Owned machines may run plane runners too.
+    {"src": ["tw-bigboi", "tw-laptop"], "dst": ["tag:easypod-plane", "tag:antibody-plane"], "ip": ["tcp:7443", "tcp:8443"]}
+  ],
+  "tests": [
+    {"src": "tag:tw", "deny": ["tw-bigboi:22", "tw-laptop:22", "tag:tw:22", "tag:easypod-coordinator:443", "tag:antibody:443", "tag:good-guy:443", "tag:easypod-plane:7443", "tag:antibody-plane:7443"]},
+    {"src": "tag:tw-easypod-runner", "accept": ["tag:easypod-plane:7443", "tag:easypod-plane:8443"], "deny": ["tag:antibody-plane:7443", "tag:easypod-coordinator:443", "tw-bigboi:22"]},
+    {"src": "tag:tw-antibody-runner", "accept": ["tag:antibody-plane:7443", "tag:antibody-plane:8443"], "deny": ["tag:easypod-plane:7443", "tag:antibody:443", "tw-bigboi:22"]},
+    {"src": "tag:easypod-plane", "deny": ["tag:tw:22", "tw-bigboi:22", "tw-laptop:22"]},
+    {"src": "tag:antibody-plane", "deny": ["tag:tw:22", "tw-bigboi:22", "tw-laptop:22"]},
+    {"src": "tw-bigboi", "accept": ["tag:tw:22", "tag:easypod-plane:7443", "tag:antibody-plane:8443"]}
+  ]
+}

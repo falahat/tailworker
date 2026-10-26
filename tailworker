@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Private machines and one-off rootless container jobs; no queue or scheduler."""
+import argparse
+import getpass
+import hashlib
+import io
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import tomllib
+import uuid
+
+HOME = Path.home()
+CONFIG = Path(os.environ.get('XDG_CONFIG_HOME', HOME / '.config')) / 'tailworker'
+CACHE = Path(os.environ.get('XDG_CACHE_HOME', HOME / '.cache')) / 'tailworker'
+LOCKS = '/var/lib/tailworker/locks'
+SSH = ['ssh', '-T', '-x', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+       '-o', 'ForwardAgent=no', '-o', 'ClearAllForwardings=yes', '-o', 'PermitLocalCommand=no',
+       '-o', 'ConnectTimeout=5', '-o', 'ConnectionAttempts=1']
+
+
+def command(host, args):
+    return list(args) if host == 'local' else SSH + [host, shlex.join(args)]
+
+
+def call(host, args, **options):
+    return subprocess.run(command(host, args), check=True, **options)
+
+
+def output(host, args):
+    return subprocess.check_output(command(host, args), text=True, stderr=subprocess.DEVNULL).strip()
+
+
+def save(path, value):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as stream:
+        stream.write(value)
+        temporary = Path(stream.name)
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def settings():
+    config = tomllib.loads((CONFIG / 'config.toml').read_text())
+    machines = config['owned']
+    if not machines or any(not re.fullmatch(r'[a-z][a-z0-9-]*', name) or
+                           not isinstance(host, str) or not host or host.startswith('-') or
+                           any(c.isspace() for c in host) for name, host in machines.items()):
+        raise ValueError('owned must map machine names to local or ordinary SSH destinations')
+    return config
+
+
+def setup():
+    for tool in ('tailscale', 'ssh', 'podman'):
+        if not shutil.which(tool):
+            raise ValueError('install ' + tool + ' before setup')
+    CONFIG.mkdir(mode=0o700, parents=True, exist_ok=True)
+    CONFIG.chmod(0o700)
+    config = CONFIG / 'config.toml'
+    if not config.exists():
+        name = socket.gethostname().split('.')[0].lower()
+        save(config, '[owned]\n' + json.dumps(name) + ' = "local"\n\n'
+             '[gcp]\nproject = ""\nzone = ""\nregion = ""\n'
+             'machine_type = ""\nimage_family = ""\nimage_project = ""\n'
+             'gpu_image_family = ""\ngpu_image_project = ""\n\n'
+             '[ssh]\npublic_keys = []\n')
+    if settings()['gcp']['project']:
+        for tool in ('gcloud', 'gh'):
+            if not shutil.which(tool):
+                raise ValueError('install ' + tool + ' before cloud setup')
+    if not (CONFIG / 'tailscale-oauth.json').exists():
+        client = getpass.getpass('Tailscale OAuth client id (blank to defer cloud setup): ')
+        if client:
+            secret = getpass.getpass('Tailscale OAuth client secret: ')
+            if not secret:
+                raise ValueError('OAuth secret is required with its client id')
+            save(CONFIG / 'tailscale-oauth.json', json.dumps(dict(client_id=client, client_secret=secret)))
+    print('Edit ' + str(config) + '; then add to your SSH configuration:')
+    print('Include ' + str(CONFIG / 'ssh_config'))
+
+
+def machines(config):
+    result = [dict(name=name, host=host, kind='owned', online=True) for name, host in config['owned'].items()]
+    state = json.loads(subprocess.check_output(['tailscale', 'status', '--json'], text=True))
+    for node in sorted(state.get('Peer', {}).values(), key=lambda node: node['HostName']):
+        if 'tag:tw' not in node.get('Tags', []):
+            continue
+        name = node['HostName'].removeprefix('tw-')
+        if not re.fullmatch(r'[a-z][a-z0-9-]*', name):
+            raise ValueError('invalid dedicated worker name')
+        address = ipaddress.ip_address(node['TailscaleIPs'][0])
+        if address not in ipaddress.ip_network('100.64.0.0/10') and address not in ipaddress.ip_network('fd7a:115c:a1e0::/48'):
+            raise ValueError('dedicated worker has no tailnet address')
+        result.append(dict(name=name, host='tw-' + name, kind='dedicated', online=node['Online'], ip=str(address)))
+    return result
+
+
+def aliases(found):
+    known = CONFIG / 'known_hosts'
+    pins = known.read_text() if known.exists() else ''
+    blocks = []
+    for machine in found:
+        if machine['kind'] != 'dedicated' or not machine['online']:
+            continue
+        alias = machine['host']
+        if not any(line.startswith(alias + ' ') for line in pins.splitlines()):
+            continue  # Only the owner-created node's first contact establishes its pin.
+        blocks.append('Host ' + alias + '\n HostName ' + machine['ip'] + '\n User tw\n'
+                      ' HostKeyAlias ' + alias + '\n UserKnownHostsFile ' + json.dumps(str(known)) + '\n'
+                      ' StrictHostKeyChecking yes\n IdentitiesOnly yes\n ForwardAgent no\n')
+    save(CONFIG / 'ssh_config', '\n'.join(blocks))
+    save(known, pins)
+
+
+def capacity(machine):
+    if not machine['online']:
+        return None
+    try:
+        value = json.loads(output(machine['host'], ['cat', '/var/lib/tailworker/capacity.json']))
+        if type(value['memory_bytes']) is not int or value['memory_bytes'] <= 0:
+            raise ValueError('invalid machine memory')
+        value['lock'] = subprocess.run(command(machine['host'], ['flock', '-n', LOCKS + '/gpu', 'true']),
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        if value['lock'] not in (0, 1):
+            raise ValueError('GPU lock probe failed')
+        return value
+    except subprocess.CalledProcessError:
+        return None
+
+
+def inventory():
+    found = machines(settings())
+    aliases(found)
+    for machine in found:
+        machine['capacity'] = capacity(machine)
+    return found
+
+
+def listing():
+    for machine in inventory():
+        value = machine['capacity']
+        if value is None:
+            print(machine['name'], machine['kind'], machine.get('ip', machine['host']), 'unreachable')
+        else:
+            print(machine['name'], machine['kind'], machine.get('ip', machine['host']),
+                  value['gpu_name'] or 'CPU', value['memory_bytes'],
+                  'busy' if value['lock'] else 'free', value.get('expires_at', ''))
+
+
+def choose(name=None, gpu=False):
+    found = inventory()
+    if name and not any(machine['name'] == name for machine in found):
+        raise ValueError('unknown machine: ' + name)
+    for machine in found:
+        value = machine['capacity']
+        if (not name or machine['name'] == name) and value is not None and (not gpu or value['gpu_name']):
+            return machine
+    raise ValueError('no reachable machine with the requested capacity')
+
+
+def archive_inputs(directory, destination):
+    directory = directory.resolve(strict=True)
+    if not directory.is_dir():
+        raise ValueError('input must be a directory')
+    with tarfile.open(destination, 'w', format=tarfile.PAX_FORMAT) as archive:
+        for path in sorted(directory.rglob('*')):
+            if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                raise ValueError('inputs must contain only regular files and directories')
+            info = archive.gettarinfo(str(path), arcname=path.relative_to(directory).as_posix())
+            info.uid = info.gid = info.mtime = 0
+            info.uname = info.gname = ''
+            info.pax_headers = {}
+            with path.open('rb') if path.is_file() else io.BytesIO() as stream:
+                archive.addfile(info, stream if path.is_file() else None)
+    with destination.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def pipe(source, destination):
+    with subprocess.Popen(source, stdout=subprocess.PIPE) as producer:
+        with subprocess.Popen(['zstd', '-q', '-T1', '-c'], stdin=producer.stdout, stdout=subprocess.PIPE) as compressor:
+            producer.stdout.close()
+            try:
+                subprocess.run(destination, stdin=compressor.stdout, check=True)
+            finally:
+                compressor.stdout.close()
+            if compressor.wait() or producer.wait():
+                raise ValueError('source or compression failed during transfer')
+
+
+def cache_inputs(host, directory):
+    CACHE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=CACHE) as temporary:
+        archive = Path(temporary) / 'input.tar'
+        digest = archive_inputs(directory, archive)
+        base = output(host, ['python3', '-c', 'import os; from pathlib import Path; print(Path(os.environ.get("XDG_CACHE_HOME",Path.home()/".cache"))/"tailworker")'])
+        path = base + '/inputs/' + digest
+        if subprocess.run(command(host, ['test', '-d', path])).returncode == 0:
+            print('input cached=' + digest, flush=True)
+        else:
+            stage = path + '-' + uuid.uuid4().hex
+            script = ('set -e; mkdir -p ' + shlex.quote(stage) + '; zstd -q -d -c | tar -xf - -C ' +
+                      shlex.quote(stage) + '; mv -T ' + shlex.quote(stage) + ' ' + shlex.quote(path))
+            pipe(['cat', str(archive)], command(host, ['bash', '-o', 'pipefail', '-c', script]))
+            print('input sent=' + digest, flush=True)
+        call(host, ['touch', path])
+        return path
+
+
+GPU_RUN = '''import fcntl,os,sys
+want=os.open(sys.argv[1]+'/gpu.want',os.O_RDONLY)
+fcntl.flock(want,fcntl.LOCK_EX)
+gpu=os.open(sys.argv[1]+'/gpu',os.O_RDONLY)
+fcntl.flock(gpu,fcntl.LOCK_EX)
+os.close(want)
+os.dup2(gpu,3,inheritable=True)
+if gpu!=3:os.close(gpu)
+os.execvp('podman',['podman','run','--preserve-fds=1',*sys.argv[2:]])
+'''
+
+PRUNE = '''import os,pathlib,re,shutil,subprocess,json,time
+base=pathlib.Path(os.environ.get('XDG_CACHE_HOME',pathlib.Path.home()/'.cache'))/'tailworker/inputs'
+if base.exists():
+    running=subprocess.check_output(['podman','ps','-q'],text=True).split()
+    containers=json.loads(subprocess.check_output(['podman','inspect',*running])) if running else []
+    active={mount['Source'] for item in containers for mount in item.get('Mounts',[])}
+    for path in base.iterdir():
+        if re.fullmatch('[0-9a-f]{64}',path.name) and path.is_dir() and not path.is_symlink():
+            if str(path) not in active and path.stat().st_mtime<time.time()-7*86400:
+                assert path.resolve().parent==base.resolve()
+                shutil.rmtree(path)
+'''
+
+
+def unpack_outputs(archive, target):
+    target.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive) as contents:
+        for item in contents:
+            path = target / item.name
+            if (not item.isdir() and not item.isfile()) or not path.resolve().is_relative_to(target.resolve()):
+                raise ValueError('worker output contains a link, special file or escaping path')
+        contents.extractall(target, filter='data')
+
+
+def run(args):
+    if not args.command:
+        raise ValueError('run requires a command after --')
+    if args.out and args.out.exists() and (not args.out.is_dir() or any(args.out.iterdir())):
+        raise ValueError('output directory must be empty or absent')
+    machine = choose(args.on, args.gpu)
+    host = machine['host']
+    if output(host, ['podman', 'info', '--format', '{{.Host.Security.Rootless}}']) != 'true':
+        raise ValueError('worker Podman must be rootless')
+    if subprocess.run(command(host, ['podman', 'image', 'exists', args.image])).returncode:
+        raise ValueError('missing image; run tailworker image send ' + args.image + ' --to ' + machine['name'])
+    call(host, ['python3', '-c', PRUNE])
+    identifier = 'tw-' + uuid.uuid4().hex
+    memory = args.memory or str(machine['capacity']['memory_bytes'] * 4 // 5)
+    flags = ['--rm', '--name', identifier, '--pull=never', '--userns=keep-id', '--memory', memory,
+             '--network', 'pasta' if args.net else 'none']
+    if args.inputs:
+        flags += ['-v', cache_inputs(host, args.inputs) + ':/in:ro']
+    remote_out = None
+    if args.out:
+        base = output(host, ['python3', '-c', 'import os; from pathlib import Path; p=Path(os.environ.get("XDG_CACHE_HOME",Path.home()/".cache"))/"tailworker/outputs"; p.mkdir(parents=True,exist_ok=True); print(p)'])
+        remote_out = output(host, ['mktemp', '-d', base + '/' + identifier + '.XXXXXXXX'])
+        flags += ['-v', remote_out + ':/out:rw']
+    if args.gpu:
+        flags += ['--device', 'nvidia.com/gpu=all']
+        launched = command(host, ['python3', '-c', GPU_RUN, LOCKS, *flags, args.image, *args.command])
+    else:
+        launched = command(host, ['podman', 'run', *flags, args.image, *args.command])
+    print('machine=' + machine['name'] + ' container=' + identifier, flush=True)
+    process = subprocess.Popen(launched)
+    try:
+        result = process.wait()
+    except KeyboardInterrupt:
+        stopped = subprocess.run(command(host, ['podman', 'stop', identifier]), stdout=subprocess.DEVNULL)
+        if stopped.returncode:
+            print('Could not confirm cancellation of ' + identifier + ' on ' + machine['name'], file=sys.stderr)
+        process.wait()
+        result = 130
+    if remote_out:
+        CACHE.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=CACHE) as temporary:
+            archive = Path(temporary) / 'output.tar'
+            with archive.open('wb') as stream:
+                call(host, ['tar', '-cf', '-', '-C', remote_out, '.'], stdout=stream)
+            unpack_outputs(archive, args.out)
+        call(host, ['python3', '-c', 'import pathlib,shutil,sys; p=pathlib.Path(sys.argv[1]); assert p.parent.name=="outputs" and p.name.startswith("tw-") and p.resolve()==p; shutil.rmtree(p)', remote_out])
+    return result
+
+
+def image_send(args):
+    machine = choose(args.to)
+    source = ['sudo', '-n', 'docker'] if args.from_docker else ['podman']
+    identifier = subprocess.check_output(source + ['image', 'inspect', '--format', '{{.Id}}', args.image], text=True).strip().removeprefix('sha256:')
+    try:
+        existing = output(machine['host'], ['podman', 'image', 'inspect', '--format', '{{.Id}}', args.image]).removeprefix('sha256:')
+    except subprocess.CalledProcessError:
+        existing = ''
+    if existing == identifier:
+        print('image cached=' + identifier)
+        return
+    if machine['host'] == 'local' and not args.from_docker:
+        return
+    pipe(source + ['save', args.image], command(machine['host'], ['bash', '-o', 'pipefail', '-c', 'zstd -q -d -c | podman load']))
+    if output(machine['host'], ['podman', 'image', 'inspect', '--format', '{{.Id}}', args.image]).removeprefix('sha256:') != identifier:
+        raise ValueError('transferred image identity differs')
+
+
+def main():
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='action', required=True)
+    commands.add_parser('setup')
+    commands.add_parser('ls')
+    run_parser = commands.add_parser('run')
+    run_parser.add_argument('--on')
+    run_parser.add_argument('--gpu', action='store_true')
+    run_parser.add_argument('--image', required=True)
+    run_parser.add_argument('--in', dest='inputs', type=Path)
+    run_parser.add_argument('--out', type=Path)
+    run_parser.add_argument('--net', action='store_true')
+    run_parser.add_argument('--memory')
+    run_parser.add_argument('command', nargs=argparse.REMAINDER)
+    images = commands.add_parser('image').add_subparsers(dest='image_action', required=True)
+    send = images.add_parser('send')
+    send.add_argument('image')
+    send.add_argument('--to', required=True)
+    send.add_argument('--from', choices=['docker'], dest='source')
+    args = parser.parse_args()
+    if args.action == 'setup':
+        setup()
+    elif args.action == 'ls':
+        listing()
+    elif args.action == 'run':
+        args.command = args.command[1:] if args.command[:1] == ['--'] else args.command
+        return run(args)
+    else:
+        args.from_docker = args.source == 'docker'
+        image_send(args)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+        sys.exit('tailworker: ' + str(error))
