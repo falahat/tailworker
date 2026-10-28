@@ -183,7 +183,7 @@ def runtime(machine):
 info = json.loads(subprocess.check_output(['podman','info','--format','json']))
 cache = pathlib.Path(os.environ.get('XDG_CACHE_HOME',pathlib.Path.home()/'.cache'))/'tailworker'
 cache.mkdir(mode=0o700,parents=True,exist_ok=True)
-graph = info['store']['graphRoot']
+graph = str(pathlib.Path(info['store']['graphRoot']).resolve())
 print(json.dumps(dict(rootless=info['host']['security']['rootless'],graph_root=graph,
                      cache_root=str(cache.resolve()),cache_free_bytes=shutil.disk_usage(cache).free,
                      graph_free_bytes=shutil.disk_usage(graph).free)))
@@ -226,7 +226,7 @@ def cache_inputs(host, directory):
     with tempfile.TemporaryDirectory(dir=CACHE) as temporary:
         archive = Path(temporary) / 'input.tar'
         digest = archive_inputs(directory, archive)
-        base = output(host, ['python3', '-c', 'import os; from pathlib import Path; print(Path(os.environ.get("XDG_CACHE_HOME",Path.home()/".cache"))/"tailworker")'])
+        base = output(host, ['python3', '-c', 'import os; from pathlib import Path; print((Path(os.environ.get("XDG_CACHE_HOME",Path.home()/".cache"))/"tailworker").resolve())'])
         path = base + '/inputs/' + digest
         if subprocess.run(command(host, ['test', '-d', path])).returncode == 0:
             print('input cached=' + digest, flush=True)
@@ -295,7 +295,7 @@ sys.exit(result)
 '''
 
 PRUNE = '''import os,pathlib,re,shutil,subprocess,json,time
-base=pathlib.Path(os.environ.get('XDG_CACHE_HOME',pathlib.Path.home()/'.cache'))/'tailworker/inputs'
+base=(pathlib.Path(os.environ.get('XDG_CACHE_HOME',pathlib.Path.home()/'.cache'))/'tailworker/inputs').resolve()
 if base.exists():
     running=subprocess.check_output(['podman','ps','-q'],text=True).split()
     containers=json.loads(subprocess.check_output(['podman','inspect',*running])) if running else []
@@ -347,7 +347,7 @@ def run(args):
         flags += ['-v', cache_inputs(host, args.inputs) + ':/in:ro']
     remote_out = None
     if args.out:
-        base = output(host, ['python3', '-c', 'import os; from pathlib import Path; p=Path(os.environ.get("XDG_CACHE_HOME",Path.home()/".cache"))/"tailworker/outputs"; p.mkdir(parents=True,exist_ok=True); print(p)'])
+        base = output(host, ['python3', '-c', 'import os; from pathlib import Path; p=Path(os.environ.get("XDG_CACHE_HOME",Path.home()/".cache"))/"tailworker/outputs"; p.mkdir(parents=True,exist_ok=True); print(p.resolve())'])
         remote_out = output(host, ['mktemp', '-d', base + '/' + identifier + '.XXXXXXXX'])
         flags += ['-v', remote_out + ':/out:rw']
     if args.gpu:
