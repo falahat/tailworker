@@ -4,9 +4,8 @@ One small machine layer for private Linux compute over an existing Tailscale
 network. Queues, retries, job history and application credentials stay with the
 consumer. This repository is private. All container jobs run with rootless Podman.
 
-The command currently implements the core milestone: `setup`, `ls`, `run` and
-`image send`. Cloud creation, deletion and dedicated bootstrap are the following
-milestone; they are not available in this revision.
+The command provides `setup`, `ls`, `run`, `image send`, and explicit owner-only
+`up gcp`/`down`. It never creates machines to satisfy a submitted job.
 
 ## Install an owned machine
 
@@ -74,6 +73,85 @@ networking, subject to that machine's host policy; `--memory` overrides the cap.
 The exit status is the container's. Ctrl-C stops only that run's named `tw-*`
 container before returning. Jobs have no timeout and are never retried.
 
+## Dedicated cloud workers: owner only
+
+The owner first merges `policy.hujson` into the existing tailnet and passes its
+tests. Create an OAuth client scoped to auth-key writes for the worker tags,
+then run `tailworker setup` on the control host and enter its credentials at
+the masked prompts. In the Google project, prepare the `tailworker` network,
+subnet and outbound Cloud NAT, with no inbound firewall rules. Install and
+authenticate `gcloud` on the control host. No GitHub CLI is required. Fill `[gcp]` in config.toml:
+project, zone, region, machine type and CPU/GPU image family/project. Images
+must be apt-based Ubuntu or Debian; GPU images must already include drivers.
+
+In `[ssh]`, `public_keys` lists approved submitters' ed25519 public-key file
+paths. Optional `pty_public_key` names the laptop's public key: it gets the
+native `restrict,pty` authorization instead of `restrict`.
+
+```sh
+tailworker up gcp --name probe --hours 1 --spot --dry-run
+tailworker up gcp --name probe --hours 1 --spot
+tailworker down probe
+```
+
+`up` requires a hard lifetime of 1–24 hours and refuses while a labelled worker
+exists. Local cloud operations serialize under a private lock. It refuses a
+name already owned by a configured machine, tailnet node or stored host pin.
+`--dry-run` prints the complete native create command and mints no credentials.
+`--machine-type`, `--disk-gb` and `--gpu` select capacity; `--spot` opts into
+Spot. GPU types carry their GPU and use the configured GPU image family.
+
+Repeat `--tag tag:tw-<app>-runner` and `--allow <app>-plane:7443`
+`--allow <app>-plane:8443` only for the plane that worker may reach. Names resolve
+through the control host's actual tailnet status. The key is non-reusable,
+ephemeral, preauthorized, tagged and valid for 15 minutes. It travels through
+0600 files into instance metadata deliberately; the guest firewall blocks
+metadata HTTP for unprivileged users before they exist, and first boot spends
+the key. Temporary files are deleted. No secret value enters argv or images.
+
+Startup configures a dedicated unprivileged `tw` account, rootless Podman,
+tailnet-only SSH and the nft egress baseline before writing the public ready
+revision. The first SSH pin is learned over the new, uniquely named tagged
+tailnet node; later connections check it strictly. Stale identities, unexpected
+tags and a different bootstrap revision fail. Startup resumes its persisted
+tailnet identity on reboot and logs out at shutdown.
+
+Repeat `--deploy-key OWNER/REPO` to generate private keys on the worker and
+register only their public halves read-only through GitHub's HTTPS REST API.
+Only this optional automation needs an owner API token. Save one plain token
+in the control host's `~/.config/tailworker/github-token` (or the corresponding
+XDG config directory), owned by the caller with mode 0600. Create/edit the file
+privately outside Git; never put its value in argv, environment or a job.
+A fine-grained personal token needs repository Administration (write), which
+includes the read permission to list keys, for only the repositories supplied
+to `--deploy-key`; Metadata (read) is implicit. See
+[GitHub's deploy-key permissions](https://docs.github.com/en/rest/deploy-keys/deploy-keys).
+The token stays on the control host and never reaches a worker. Ordinary jobs
+and public-dependency workers need no GitHub administration credential. Private
+fetch credentials can also be provisioned separately, with the public key
+registered manually in the provider's browser UI, without this API automation.
+Read-only source tokens belong to the consuming project's fetch secrets and
+are separate from this optional Administration token. A source token cannot
+perform these deploy-key administration operations.
+`--deploy-dir` selects their private directory and `--deploy-base` selects the
+paths consumers see inside their secret mount; for example, ci-buddy uses
+`.ci-buddy/projects/<project>/secrets` and `/run/secrets`. GitHub host keys come
+from its HTTPS metadata API. Private halves stay on the worker.
+
+`down` removes only deploy keys with the exact `tw-NAME` title in the explicit
+`tw-deploy-repos` repository scope recorded by `up`, and deletes the labelled VM. Its root
+shutdown unit logs out; the job account has no Tailscale administration.
+The control host must observe the named node absent before cleanup succeeds
+and its alias is removed; an offline node still counts as present. A recorded
+empty repository scope needs no GitHub credential. Key lists follow GitHub's
+[native pagination links](https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api).
+Missing scope, an expired VM whose metadata is gone, or inadequate API authority
+leaves key cleanup explicitly unverified; no account-wide discovery or deletion
+is attempted. The owned VM is still deleted, and the owner checks any remaining
+keys manually. Failed cleanup names what remains; no action is retried. VM deletion at the hard lifetime is
+enforced by the provider. Creation failures leave the
+possible VM for explicit owner inspection rather than guessing and deleting it.
+
 ## GPU contract
 
 Every GPU user shares `/var/lib/tailworker/locks/gpu.want` and `gpu`. A job
@@ -121,8 +199,11 @@ Dedicated machines must have a separate unprivileged account, rootless Podman,
 tailnet-only OpenSSH with approved separate machine keys and strict host pins,
 no Tailscale SSH, no public address, no service account and no worker-initiated
 connection to submitters or private networks. Their mandatory egress baseline,
-short-lived single-use tagged enrollment and hard VM lifetime belong to the
-next milestone. Until then, no dedicated machine is provisioned or admitted.
+short-lived single-use tagged enrollment and hard VM lifetime are supplied by
+dedicated bootstrap and `up`. A dedicated bootstrap copy must have its reviewed
+commit substituted for `@REVISION@`; `up` does that automatically. A non-cloud
+machine reads the same `tw-*` inputs from 0600 files beside that private copy,
+outside Git.
 Existing owned hosts remain trusted; containers do not prove that a compromised
 host cannot attack its network. Enabling `--net` on an owned host uses that
 host's current network policy.
@@ -131,9 +212,10 @@ Before production adoption the owner prepares the GPU locks, merges and tests
 the tailnet policy, supplies scoped OAuth/Google/GitHub credentials outside
 jobs, and performs the approved one-instance cloud check. Same-machine and
 offline tests do not establish cross-machine isolation. No cloud has been
-activated by the core implementation.
+activated by fixture tests. The actual provider/network check remains an owner
+operation; offline tests cannot verify those controls across real machines.
 
 Run source checks with `python3 check.py` and `python3 -m unittest discover tests`.
 The command, bootstrap and check stay below 800 lines total; tests stay below
 300. These are hard caps. Their unit checks do not replace the owned-host
-container, GPU, transfer and cancellation checks required before M1 lands.
+container, GPU, transfer and cancellation checks or the owner's cloud check.
