@@ -144,9 +144,10 @@ def protected(cloud, policy, kind, resource):
 def deploy(cloud, policy, args):
     resource = manifest(args, policy)
     if args.dry_run:
+        template = resource['spec']['template']['spec']
+        containers = (template['template']['spec'] if args.kind == 'job' else template)['containers']
         return dict(action='deploy', id=reference(cloud, args.kind, name(args.name)),
-                    images=[item['image'] for item in resource['spec']['template']['spec'].get('containers',
-                            resource['spec']['template']['spec'].get('template', {}).get('spec', {}).get('containers', []))],
+                    images=[item['image'] for item in containers], limits=[item.get('resources', {}).get('limits', {}) for item in containers],
                     service_account=policy['service_account'], network=policy['network'], instances=1)
     existing = sdk(cloud, args.kind + 's', 'list', '--filter=metadata.name=' + name(args.name))
     for item in existing:
@@ -210,7 +211,11 @@ def invoke(cloud, policy, args, target):
     if 'serviceAccount:' + account not in policy['invokers']:
         raise ValueError('configure cloud_run.invoke_as as an approved caller service account')
     credential = token(cloud, 'identity', '--audiences=' + target['audience'], '--impersonate-service-account=' + account)
-    status, body = http(target['url'] + args.path, credential, args.data.read_bytes() if args.data else None, args.content_type)
+    body = None
+    if args.data:
+        with args.data.open('rb') as stream:
+            body = stream.read(16 * 1024 * 1024 + 1)
+    status, body = http(target['url'] + args.path, credential, body, args.content_type)
     return dict(status=status, body=body.decode('utf-8', 'replace'))
 
 
@@ -238,7 +243,6 @@ def execute(cloud, policy, args):
     value = name(args.name)
     resource = discover(cloud, args.kind, value)[0]
     if args.action == 'describe':
-        protected(cloud, policy, args.kind, resource)
         protected(cloud, policy, args.kind, resource)
         return descriptor(cloud, args.kind, resource)
     if args.action == 'delete':
