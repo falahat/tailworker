@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import fcntl
 import importlib.machinery
 import importlib.util
@@ -6,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,17 @@ loader.exec_module(tw)
 class Core(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def test_native_control_import_does_not_require_fcntl(self):
+        with mock.patch.dict(sys.modules, fcntl=None):
+            loader.exec_module(tw)
+
+    def test_resolve_returns_the_selected_approved_machine(self):
+        machine = dict(name='worker', host='tw-worker', kind='dedicated', online=True,
+                       capacity=dict(gpu_name='GPU'))
+        with mock.patch.object(tw, 'inventory', return_value=[machine]), mock.patch.object(sys, 'argv', ['tailworker', 'resolve', 'worker']), contextlib.redirect_stdout(io.StringIO()) as captured:
+            self.assertEqual(tw.main(), 0)
+        self.assertEqual(json.loads(captured.getvalue()), machine)
 
     def test_input_identity_ignores_times_and_roundtrips_three_files(self):
         source = self.root / 'source'
@@ -79,18 +92,27 @@ class Core(unittest.TestCase):
                               'print(json.dumps(dict(args=sys.argv[1:],fd=os.fstat(3).st_ino)),flush=True)\n'
                               'sys.stdin.read(1)\n')
         executable.chmod(0o700)
+        receipt = self.root / 'receipt.json'
         with mock.patch.dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH']):
-            process = subprocess.Popen([sys.executable, '-c', tw.GPU_RUN, str(locks), '--rm', 'image', 'true'],
+            process = subprocess.Popen([sys.executable, '-c', tw.RUN, str(locks), str(receipt), '1', 'own', '--rm', 'image', 'true'],
                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             try:
                 ready = json.loads(process.stdout.readline())
                 self.assertEqual(ready['fd'], (locks / 'gpu').stat().st_ino)
                 self.assertEqual(ready['args'][:2], ['run', '--preserve-fds=1'])
+                waiting = self.root / 'waiting.json'
+                waiter = subprocess.Popen([sys.executable, '-c', tw.RUN, str(locks), str(waiting), '1', 'waiting', 'true'], stdout=subprocess.PIPE)
+                while not waiting.with_suffix('.pid').exists():
+                    time.sleep(0.01)
+                waiter.send_signal(signal.SIGINT)
+                self.assertEqual((waiter.communicate()[0], waiter.returncode), (b'', 130))
+                self.assertEqual(json.loads(waiting.read_text())['execution_seconds'], 0)
                 with (locks / 'gpu').open() as lock:
                     with self.assertRaises(BlockingIOError):
                         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 process.communicate('x')
                 self.assertEqual(process.returncode, 0)
+                self.assertEqual(json.loads(receipt.read_text())['exit_code'], 0)
             finally:
                 if process.poll() is None:
                     process.terminate()
@@ -132,17 +154,28 @@ class Core(unittest.TestCase):
         self.assertTrue((fresh / 'input').is_file())
 
     def test_offline_run_uses_memory_cap_and_never_pulls(self):
-        args = argparse.Namespace(on=None, gpu=False, image='image', inputs=None, out=None,
+        args = argparse.Namespace(on=None, gpu=False, image='image', inputs=None, out=None, receipt=self.root / 'receipt.json',
                                   net=False, memory=None, command=['sh', '-c', 'exit 23'])
         machine = dict(name='owned', host='local', capacity=dict(memory_bytes=1000))
         process = mock.Mock()
         process.wait.return_value = 23
-        with mock.patch.object(tw, 'choose', return_value=machine), mock.patch.object(tw, 'output', return_value='true'), mock.patch.object(tw, 'call'), mock.patch.object(tw.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), mock.patch.object(tw.subprocess, 'Popen', return_value=process) as launch, mock.patch('sys.stdout', io.StringIO()):
+        image = 'sha256:' + 'a' * 64
+        answers = ['true', image, '/work/receipts/result.json', json.dumps(dict(gpu_lock_wait_seconds=0, execution_seconds=2.5, exit_code=23))]
+        with mock.patch.object(tw, 'choose', return_value=machine), mock.patch.object(tw, 'output', side_effect=answers), mock.patch.object(tw, 'call'), mock.patch.object(tw.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), mock.patch.object(tw.subprocess, 'Popen', return_value=process) as launch, mock.patch('sys.stdout', io.StringIO()):
             self.assertEqual(tw.run(args), 23)
         command = launch.call_args.args[0]
         self.assertEqual(command[command.index('--network') + 1], 'none')
         self.assertEqual(command[command.index('--memory') + 1], '800')
         self.assertIn('--pull=never', command)
+        for flag in ('--read-only', '--cap-drop=all', '--security-opt=no-new-privileges', image):
+            self.assertIn(flag, command)
+        receipt = json.loads(args.receipt.read_text())
+        self.assertEqual((receipt['machine'], receipt['host'], receipt['image_id'], receipt['exit_code']), ('owned', 'local', image, 23))
+        self.assertEqual(receipt['execution_seconds'], 2.5)
+        self.assertEqual(receipt['gpu_lock_wait_seconds'], 0)
+        self.assertTrue(receipt['container'].startswith('tw-'))
+        with self.assertRaisesRegex(ValueError, 'receipt must be new'):
+            tw.run(args)
 
 
 if __name__ == '__main__':

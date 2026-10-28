@@ -47,6 +47,8 @@ their existing pins remain until explicit teardown. First-contact enrollment
 belongs to the cloud milestone, not discovery.
 `ls --json` returns logical names, SSH aliases, availability and capacity.
 Use the logical name with `--on`; use its `host` alias with SSH.
+`resolve NAME` returns one reachable approved machine as JSON, including its
+`host` alias and capacity. Consumers use this for enrollment without guessing IPs.
 
 ```sh
 tailworker image send IMAGE --to MACHINE
@@ -60,21 +62,31 @@ order, then dedicated nodes by name. `--gpu` requires a GPU. An occupied GPU
 waits on its machine's shared lock; there is no scheduler. Images must already
 exist; a missing image names the `image send` command to use. Image transfer
 compares image IDs, then uses `save | zstd | ssh | load` when necessary. The
-owner's `image send --from docker` reads an existing root Docker image with
-`sudo -n docker save`; it does not run work through that daemon. An unreachable
+owner's `image send --from docker` reads an existing Docker image using the
+caller's existing permissions; it never escalates privileges. An unreachable
 laptop can import from the control host by starting the reverse pipe locally:
-`ssh CONTROL sudo -n docker save IMAGE | podman load`.
+`ssh CONTROL docker save IMAGE | podman load`.
 
 Inputs are regular files/directories only, packed in sorted order with zero
 timestamps and named by SHA-256. A cache hit sends no input again. Inputs are
 mounted read-only at `/in`. `--out` must be empty or absent and receives the
 job's fresh `/out`; returned links, special files and paths escaping that
 directory are refused. Unused input cache entries expire after seven days.
+Input tar files stream through Python and SSH; Windows callers need no local
+`cat`, `zstd` or `fcntl` for `resolve` and `run` against a Linux machine.
 
-Runs default to no network and 80% of the machine's memory. `--net` opts into
+Runs use an immutable image ID, a read-only root, dropped capabilities,
+no-new-privileges and writable temporary filesystems. They default to no
+network and 80% of the machine's memory. `--net` opts into
 networking, subject to that machine's host policy; `--memory` overrides the cap.
 The exit status is the container's. Ctrl-C stops only that run's named `tw-*`
 container before returning. Jobs have no timeout and are never retried.
+
+`run --receipt FILE` writes private trusted-host JSON after execution. It
+contains `machine`, `host`, `image_id`, `container`, `gpu`, `exit_code`,
+`gpu_lock_wait_seconds` and `execution_seconds`. Timing uses the worker's
+monotonic clock; execution starts after acquiring the GPU lock. Its staging
+file stays outside the job's mounts. FILE must be new and outside `--out`.
 
 ## Cloud Run
 
@@ -241,7 +253,7 @@ possible VM for explicit owner inspection rather than guessing and deleting it.
 
 Every GPU user shares `/var/lib/tailworker/locks/gpu.want` and `gpu`. A job
 locks `gpu.want`, then `gpu`, releases `gpu.want` and holds `gpu` for its GPU
-work. The container inherits the locked descriptor, so it retains the lock
+work. The container inherits descriptor 3 with `TAILWORKER_GPU_LEASE_FD=3`, so it retains the lock
 even if its submitting process disappears.
 
 Resident model servers acquire `gpu` before loading models. Between jobs and

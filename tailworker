@@ -8,7 +8,6 @@ if __name__ == '__main__' and sys.argv[1:2] in (['job'], ['service']):
 import argparse
 import base64
 from datetime import datetime, timedelta, timezone
-import fcntl
 import getpass
 import hashlib
 import io
@@ -220,23 +219,66 @@ def cache_inputs(host, directory):
             print('input cached=' + digest, flush=True)
         else:
             stage = path + '-' + uuid.uuid4().hex
-            script = ('set -e; mkdir -p ' + shlex.quote(stage) + '; zstd -q -d -c | tar -xf - -C ' +
+            script = ('set -e; mkdir -p ' + shlex.quote(stage) + '; tar -xf - -C ' +
                       shlex.quote(stage) + '; mv -T ' + shlex.quote(stage) + ' ' + shlex.quote(path))
-            pipe(['cat', str(archive)], command(host, ['bash', '-o', 'pipefail', '-c', script]))
+            with archive.open('rb') as stream:
+                call(host, ['bash', '-o', 'pipefail', '-c', script], stdin=stream)
             print('input sent=' + digest, flush=True)
         call(host, ['touch', path])
         return path
 
 
-GPU_RUN = '''import fcntl,os,sys
-want=os.open(sys.argv[1]+'/gpu.want',os.O_RDONLY)
-fcntl.flock(want,fcntl.LOCK_EX)
-gpu=os.open(sys.argv[1]+'/gpu',os.O_RDONLY)
-fcntl.flock(gpu,fcntl.LOCK_EX)
-os.close(want)
-os.dup2(gpu,3,inheritable=True)
-if gpu!=3:os.close(gpu)
-os.execvp('podman',['podman','run','--preserve-fds=1',*sys.argv[2:]])
+RUN = '''import fcntl,json,os,pathlib,signal,subprocess,sys,time
+os.umask(0o077)
+locks, receipt, gpu, container = sys.argv[1:5]
+path = pathlib.Path(receipt)
+path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+pid = path.with_suffix('.pid')
+child = acquired = None
+launching = cancelled = False
+def cancel(*unused):
+    global cancelled
+    cancelled = True
+    if not launching:
+        raise KeyboardInterrupt
+signal.signal(signal.SIGINT, cancel)
+started = time.monotonic()
+try:
+    pid.write_text(str(os.getpid()))
+    if path.with_suffix('.cancel').exists():
+        raise KeyboardInterrupt
+    if gpu == '1':
+        want = os.open(locks + '/gpu.want', os.O_RDONLY)
+        fcntl.flock(want, fcntl.LOCK_EX)
+        lease = os.open(locks + '/gpu', os.O_RDONLY)
+        fcntl.flock(lease, fcntl.LOCK_EX)
+        os.close(want)
+        os.dup2(lease, 3, inheritable=True)
+        if lease != 3:
+            os.close(lease)
+    acquired = time.monotonic()
+    launching = True
+    child = subprocess.Popen(['podman', 'run', *(['--preserve-fds=1'] if gpu == '1' else []), *sys.argv[5:]], pass_fds=(3,) if gpu == '1' else ())
+    launching = False
+    if cancelled:
+        raise KeyboardInterrupt
+    result = child.wait()
+except KeyboardInterrupt:
+    if child:
+        if child.poll() is None:
+            child.terminate()
+        child.wait()
+        subprocess.run(['podman', 'stop', container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    result = 130
+finally:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    pid.unlink(missing_ok=True)
+    path.with_suffix('.cancel').unlink(missing_ok=True)
+finished = time.monotonic()
+with path.open('x') as stream:
+    json.dump(dict(gpu_lock_wait_seconds=(acquired or finished) - started if gpu == '1' else 0,
+                   execution_seconds=finished - acquired if acquired else 0, exit_code=result), stream)
+sys.exit(result)
 '''
 
 PRUNE = '''import os,pathlib,re,shutil,subprocess,json,time
@@ -268,16 +310,25 @@ def run(args):
         raise ValueError('run requires a command after --')
     if args.out and args.out.exists() and (not args.out.is_dir() or any(args.out.iterdir())):
         raise ValueError('output directory must be empty or absent')
+    if args.receipt and (args.receipt.exists() or args.receipt.is_symlink() or
+                         (args.out and args.receipt.resolve().is_relative_to(args.out.resolve()))):
+        raise ValueError('receipt must be new and outside the output directory')
     machine = choose(args.on, args.gpu)
     host = machine['host']
     if output(host, ['podman', 'info', '--format', '{{.Host.Security.Rootless}}']) != 'true':
         raise ValueError('worker Podman must be rootless')
-    if subprocess.run(command(host, ['podman', 'image', 'exists', args.image])).returncode:
-        raise ValueError('missing image; run tailworker image send ' + args.image + ' --to ' + machine['name'])
+    try:
+        image = output(host, ['podman', 'image', 'inspect', '--format', '{{.Id}}', args.image])
+    except subprocess.CalledProcessError:
+        raise ValueError('missing image; run tailworker image send ' + args.image + ' --to ' + machine['name']) from None
+    if not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
+        raise ValueError('worker returned an invalid image identity')
     call(host, ['python3', '-c', PRUNE])
     identifier = 'tw-' + uuid.uuid4().hex
     memory = args.memory or str(machine['capacity']['memory_bytes'] * 4 // 5)
     flags = ['--rm', '--name', identifier, '--pull=never', '--userns=keep-id', '--memory', memory,
+             '--read-only', '--cap-drop=all', '--security-opt=no-new-privileges',
+             '--tmpfs', '/tmp:rw,nosuid,nodev,size=1g', '--tmpfs', '/run:rw,nosuid,nodev,size=64m',
              '--network', 'pasta' if args.net else 'none']
     if args.inputs:
         flags += ['-v', cache_inputs(host, args.inputs) + ':/in:ro']
@@ -287,20 +338,26 @@ def run(args):
         remote_out = output(host, ['mktemp', '-d', base + '/' + identifier + '.XXXXXXXX'])
         flags += ['-v', remote_out + ':/out:rw']
     if args.gpu:
-        flags += ['--device', 'nvidia.com/gpu=all']
-        launched = command(host, ['python3', '-c', GPU_RUN, LOCKS, *flags, args.image, *args.command])
-    else:
-        launched = command(host, ['podman', 'run', *flags, args.image, *args.command])
+        flags += ['--device', 'nvidia.com/gpu=all', '-v', LOCKS + ':' + LOCKS + ':ro', '-e', 'TAILWORKER_GPU_LEASE_FD=3']
+    receipt = output(host, ['python3', '-c', 'import os,pathlib,sys; print(pathlib.Path(os.environ.get("XDG_CACHE_HOME",pathlib.Path.home()/".cache"))/"tailworker/receipts"/sys.argv[1])', identifier + '.json'])
+    launched = command(host, ['python3', '-c', RUN, LOCKS, receipt, '1' if args.gpu else '0', identifier, *flags, image, *args.command])
     print('machine=' + machine['name'] + ' container=' + identifier, flush=True)
     process = subprocess.Popen(launched)
     try:
         result = process.wait()
     except KeyboardInterrupt:
-        stopped = subprocess.run(command(host, ['podman', 'stop', identifier]), stdout=subprocess.DEVNULL)
+        stopped = subprocess.run(command(host, ['python3', '-c', 'import os,pathlib,signal,sys; p=pathlib.Path(sys.argv[1]); p.with_suffix(".cancel").touch(); p=p.with_suffix(".pid"); os.kill(int(p.read_text()),signal.SIGINT) if p.exists() else None', receipt]), stdout=subprocess.DEVNULL)
         if stopped.returncode:
             print('Could not confirm cancellation of ' + identifier + ' on ' + machine['name'], file=sys.stderr)
         process.wait()
         result = 130
+    if args.receipt:
+        value = json.loads(output(host, ['cat', receipt]))
+        value.update(machine=machine['name'], host=host, image_id=image, container=identifier, gpu=args.gpu)
+        args.receipt.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with os.fdopen(os.open(args.receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as stream:
+            stream.write(json.dumps(value, sort_keys=True) + '\n')
+    call(host, ['rm', '-f', receipt, receipt.removesuffix('.json') + '.cancel'])
     if remote_out:
         CACHE.mkdir(mode=0o700, parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=CACHE) as temporary:
@@ -314,7 +371,7 @@ def run(args):
 
 def image_send(args):
     machine = choose(args.to)
-    source = ['sudo', '-n', 'docker'] if args.from_docker else ['podman']
+    source = ['docker'] if args.from_docker else ['podman']
     identifier = subprocess.check_output(source + ['image', 'inspect', '--format', '{{.Id}}', args.image], text=True).strip().removeprefix('sha256:')
     try:
         existing = output(machine['host'], ['podman', 'image', 'inspect', '--format', '{{.Id}}', args.image]).removeprefix('sha256:')
@@ -579,6 +636,7 @@ def main():
         commands.add_parser(kind, help='native Cloud Run ' + kind + ' operations')
     commands.add_parser('setup')
     commands.add_parser('ls').add_argument('--json', action='store_true')
+    commands.add_parser('resolve').add_argument('name')
     run_parser = commands.add_parser('run')
     run_parser.add_argument('--on')
     run_parser.add_argument('--gpu', action='store_true')
@@ -587,6 +645,7 @@ def main():
     run_parser.add_argument('--out', type=Path)
     run_parser.add_argument('--net', action='store_true')
     run_parser.add_argument('--memory')
+    run_parser.add_argument('--receipt', type=Path)
     run_parser.add_argument('command', nargs=argparse.REMAINDER)
     images = commands.add_parser('image').add_subparsers(dest='image_action', required=True)
     send = images.add_parser('send')
@@ -611,6 +670,8 @@ def main():
         setup()
     elif args.action == 'ls':
         listing(args.json)
+    elif args.action == 'resolve':
+        print(json.dumps(choose(args.name)))
     elif args.action == 'run':
         args.command = args.command[1:] if args.command[:1] == ['--'] else args.command
         return run(args)
@@ -618,6 +679,7 @@ def main():
         args.from_docker = args.source == 'docker'
         image_send(args)
     else:
+        import fcntl
         with (CONFIG / 'cloud.lock').open('a+') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             (up if args.action == 'up' else down)(args, settings())
