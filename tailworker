@@ -342,14 +342,16 @@ def run(args):
     receipt = output(host, ['python3', '-c', 'import os,pathlib,sys; print(pathlib.Path(os.environ.get("XDG_CACHE_HOME",pathlib.Path.home()/".cache"))/"tailworker/receipts"/sys.argv[1])', identifier + '.json'])
     launched = command(host, ['python3', '-c', RUN, LOCKS, receipt, '1' if args.gpu else '0', identifier, *flags, image, *args.command])
     print('machine=' + machine['name'] + ' container=' + identifier, flush=True)
-    process = subprocess.Popen(launched)
+    process = None
     try:
+        process = subprocess.Popen(launched)
         result = process.wait()
     except KeyboardInterrupt:
         stopped = subprocess.run(command(host, ['python3', '-c', 'import os,pathlib,signal,sys; p=pathlib.Path(sys.argv[1]); p.with_suffix(".cancel").touch(); p=p.with_suffix(".pid"); os.kill(int(p.read_text()),signal.SIGINT) if p.exists() else None', receipt]), stdout=subprocess.DEVNULL)
         if stopped.returncode:
             print('Could not confirm cancellation of ' + identifier + ' on ' + machine['name'], file=sys.stderr)
-        process.wait()
+        if process:
+            process.wait()
         result = 130
     if args.receipt:
         value = json.loads(output(host, ['cat', receipt]))
@@ -357,7 +359,7 @@ def run(args):
         args.receipt.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with os.fdopen(os.open(args.receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as stream:
             stream.write(json.dumps(value, sort_keys=True) + '\n')
-    call(host, ['rm', '-f', receipt, receipt.removesuffix('.json') + '.cancel'])
+    call(host, ['python3', '-c', 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); done=p.exists(); p.unlink(missing_ok=True); p.with_suffix(".cancel").unlink(missing_ok=True) if done else None', receipt])
     if remote_out:
         CACHE.mkdir(mode=0o700, parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=CACHE) as temporary:
