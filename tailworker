@@ -318,7 +318,7 @@ def run(args):
     if output(host, ['podman', 'info', '--format', '{{.Host.Security.Rootless}}']) != 'true':
         raise ValueError('worker Podman must be rootless')
     try:
-        image = output(host, ['podman', 'image', 'inspect', '--format', '{{.Id}}', args.image])
+        image = 'sha256:' + output(host, ['podman', 'image', 'inspect', '--format', '{{.Id}}', args.image]).removeprefix('sha256:')
     except subprocess.CalledProcessError:
         raise ValueError('missing image; run tailworker image send ' + args.image + ' --to ' + machine['name']) from None
     if not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
