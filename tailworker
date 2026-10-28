@@ -575,6 +575,8 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='action', required=True)
+    for kind in ('job', 'service'):
+        commands.add_parser(kind, help='native Cloud Run ' + kind + ' operations')
     commands.add_parser('setup')
     commands.add_parser('ls').add_argument('--json', action='store_true')
     run_parser = commands.add_parser('run')

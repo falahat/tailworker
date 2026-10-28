@@ -1,11 +1,12 @@
 # tailworker
 
-One small machine layer for private Linux compute over an existing Tailscale
-network. Queues, retries, job history and application credentials stay with the
-consumer. This repository is private. All container jobs run with rootless Podman.
+Shared private compute: Linux machines over Tailscale and native Google Cloud
+Run Jobs and Services. Projects own their workloads and queues; tailworker owns
+resource lifecycle and discovery. Linux jobs use rootless Podman; Cloud Run
+provides its own runtime. This repository is private.
 
-The command provides `setup`, `ls`, `run`, `image send`, and explicit owner-only
-`up gcp`/`down`. It never creates machines to satisfy a submitted job.
+Commands: `setup`, `ls`, `run`, `image send`, owner-only `up gcp`/`down`, and
+`job`/`service` operations. Execution never creates a resource automatically.
 
 ## Install an owned machine
 
@@ -44,6 +45,8 @@ stays visible. Online dedicated nodes get `tw-NAME` SSH aliases only after
 owner enrollment has established their host pin. Offline aliases disappear;
 their existing pins remain until explicit teardown. First-contact enrollment
 belongs to the cloud milestone, not discovery.
+`ls --json` returns logical names, SSH aliases, availability and capacity.
+Use the logical name with `--on`; use its `host` alias with SSH.
 
 ```sh
 tailworker image send IMAGE --to MACHINE
@@ -72,6 +75,88 @@ Runs default to no network and 80% of the machine's memory. `--net` opts into
 networking, subject to that machine's host policy; `--memory` overrides the cap.
 The exit status is the container's. Ctrl-C stops only that run's named `tw-*`
 container before returning. Jobs have no timeout and are never retried.
+
+## Cloud Run
+
+Cloud Run commands need Python 3.11+ and authenticated `gcloud`, without Podman,
+Tailscale or Linux bootstrap on the caller. Windows can use `python tailworker
+service ...`. The owner prepares the project/APIs, container images, dedicated
+workload and caller service accounts, VPC/subnet, egress firewall and private
+route. Add actual values to the owner's XDG `tailworker/config.toml`:
+
+```toml
+[gcp]
+project = "your-google-project"
+region = "us-central1"
+
+[cloud_run]
+service_account = "worker@your-google-project.iam.gserviceaccount.com"
+network = "tailworker"
+subnet = "tailworker"
+invokers = ["serviceAccount:caller@your-google-project.iam.gserviceaccount.com"]
+invoke_as = "caller@your-google-project.iam.gserviceaccount.com"
+```
+
+Workload identity gets only its data permissions. The deployer needs resource/IAM
+administration; callers need resource/IAM read access plus execution permission.
+`ls` needs project-level list access. Service invocation impersonates `invoke_as`
+with an audience-bound identity token; the control identity needs token-creator
+permission on that approved caller account. No service-account keys, GitHub
+fetch tokens or control credentials are sent to workloads.
+
+The owner reviews a local dry run before deployment. These sample images exist:
+
+```sh
+tailworker service deploy hello --image us-docker.pkg.dev/cloudrun/container/hello --dry-run
+tailworker service deploy hello --image us-docker.pkg.dev/cloudrun/container/hello
+tailworker service describe hello
+tailworker service invoke hello
+
+tailworker job deploy sample --image us-docker.pkg.dev/cloudrun/container/job --dry-run
+tailworker job deploy sample --image us-docker.pkg.dev/cloudrun/container/job
+tailworker job run sample --wait
+tailworker job executions sample
+```
+
+Both kinds support `ls`, `describe NAME`, `logs NAME` and `delete NAME`.
+`job cancel NAME EXECUTION` checks the execution belongs to that job. Without
+`--wait`, run returns its execution ID immediately. Waiting returns nonzero on
+failure. Submission uses one HTTPS POST; it is never retried. After a disconnect,
+inspect execution history before submitting again. Google task/request deadlines
+remain platform limits; tailworker adds no watchdog. SDK reads and idempotent
+resource operations retain Google's transport behavior.
+
+All output is JSON. Discovery returns `kind`, logical `name`, provider `id` and
+readiness; Services include `url`, token `audience`, authentication and ingress.
+Google's records are authoritative, with a `tw-` prefix and `tailworker=1` label.
+Callers keep project/region/name and resolve again instead of storing an IP.
+No registry, discovery daemon or resource database is added. Replacement and
+deletion refuse unowned resources; failures may leave a resource for inspection.
+
+Services enforce internal ingress, IAM, zero minimum and one maximum instance.
+Invocation requires an existing private network path; IAM/Tailscale membership
+alone does not establish one. Tokens stay in memory, redirects are refused and
+no listener opens on the caller. `invoke --path /endpoint --data request.json`
+POSTs a body; requests/responses are bounded to16MiB. Jobs enforce one task,
+parallelism one and zero task retries. An active execution blocks another local
+request, but concurrent callers can race: these are not global spending caps.
+The owner must enforce Google quotas and spending controls before activation.
+
+For simple images use `--cpu`/`--memory`. `--file workload.json` instead of
+`--image` accepts a native container spec: `containers`, optional `volumes`,
+`nodeSelector`, `timeoutSeconds`, `containerConcurrency`. This supports GPU,
+sidecars, commands and storage without project logic in tailworker. Production
+images should be digest-pinned; specs contain public settings/references, never
+inline secrets. tailworker supplies identity and enclosing resource policy.
+Existing IAM bindings, conditions and etags are preserved; only missing approved
+execution grants are added. Unexpected/public grants require owner review.
+
+Both kinds force all egress through the configured VPC. Its firewall must block
+connections back to submitters/LAN; inherited Google administrator permissions
+and private routing remain owner responsibilities. Deployment/deletion are
+explicit owner actions. Service HTTP requests have no universal cancellation;
+use Jobs for cancellable batch work. Offline tests do not verify live Google
+IAM, quotas, GPU support or network isolation and create no cloud resources.
 
 ## Dedicated cloud workers: owner only
 
