@@ -17,7 +17,7 @@ accounts, SSH, Tailscale identity or firewall policy. Existing CDI specification
 and lock-file inodes are preserved. WSL is an owned machine, never a dedicated
 worker: its distributions share their network namespace.
 
-Clone this repository on the control host, review its commit, then:
+Clone this repository's `main` branch on the control host, review its commit, then:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
