@@ -4,11 +4,12 @@ import ast
 import subprocess
 
 root = Path(__file__).resolve().parent
-code = sum(len((root / name).read_text().splitlines()) for name in ('tailworker', 'bootstrap.sh', 'check.py'))
+sources = ('tailworker', 'bootstrap.sh', 'check.py', 'cloudrun.py')
+code = sum(len((root / name).read_text().splitlines()) for name in sources)
 tests = sum(len(path.read_text().splitlines()) for path in (root / 'tests').rglob('*.py'))
 assert code < 800, code
 assert tests < 300, tests
-for name in ('tailworker', 'check.py'):
+for name in ('tailworker', 'check.py', 'cloudrun.py'):
     ast.parse((root / name).read_text())
 subprocess.run(['bash', '-n', str(root / 'bootstrap.sh')], check=True)
 for name in subprocess.check_output(['git', 'ls-files'], cwd=root, text=True).splitlines():
