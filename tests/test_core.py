@@ -31,11 +31,13 @@ class Core(unittest.TestCase):
             loader.exec_module(tw)
 
     def test_resolve_returns_the_selected_approved_machine(self):
+        self.enterContext(mock.patch.object(tw, 'output', return_value='{"rootless":true}'))
         machine = dict(name='worker', host='tw-worker', kind='dedicated', online=True,
                        capacity=dict(gpu_name='GPU'))
         with mock.patch.object(tw, 'inventory', return_value=[machine]), mock.patch.object(sys, 'argv', ['tailworker', 'resolve', 'worker']), contextlib.redirect_stdout(io.StringIO()) as captured:
             self.assertEqual(tw.main(), 0)
         self.assertEqual(json.loads(captured.getvalue()), machine)
+        self.assertTrue(machine['runtime']['rootless'])
 
     def test_input_identity_ignores_times_and_roundtrips_three_files(self):
         source = self.root / 'source'
@@ -160,7 +162,7 @@ class Core(unittest.TestCase):
         process = mock.Mock()
         process.wait.return_value = 23
         image = 'sha256:' + 'a' * 64
-        answers = ['true', image, '/work/receipts/result.json', json.dumps(dict(gpu_lock_wait_seconds=0, execution_seconds=2.5, exit_code=23))]
+        answers = ['true', image.removeprefix('sha256:'), '/work/receipts/result.json', json.dumps(dict(gpu_lock_wait_seconds=0, execution_seconds=2.5, exit_code=23))]
         with mock.patch.object(tw, 'choose', return_value=machine), mock.patch.object(tw, 'output', side_effect=answers), mock.patch.object(tw, 'call'), mock.patch.object(tw.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), mock.patch.object(tw.subprocess, 'Popen', return_value=process) as launch, mock.patch('sys.stdout', io.StringIO()):
             self.assertEqual(tw.run(args), 23)
         command = launch.call_args.args[0]

@@ -178,6 +178,19 @@ def choose(name=None, gpu=False):
     raise ValueError('no reachable machine with the requested capacity')
 
 
+def runtime(machine):
+    script = '''import json,os,pathlib,shutil,subprocess
+info = json.loads(subprocess.check_output(['podman','info','--format','json']))
+cache = pathlib.Path(os.environ.get('XDG_CACHE_HOME',pathlib.Path.home()/'.cache'))/'tailworker'
+cache.mkdir(mode=0o700,parents=True,exist_ok=True)
+graph = info['store']['graphRoot']
+print(json.dumps(dict(rootless=info['host']['security']['rootless'],graph_root=graph,
+                     cache_root=str(cache.resolve()),cache_free_bytes=shutil.disk_usage(cache).free,
+                     graph_free_bytes=shutil.disk_usage(graph).free)))
+'''
+    return json.loads(output(machine['host'], ['python3', '-c', script]))
+
+
 def archive_inputs(directory, destination):
     directory = directory.resolve(strict=True)
     if not directory.is_dir():
@@ -673,7 +686,9 @@ def main():
     elif args.action == 'ls':
         listing(args.json)
     elif args.action == 'resolve':
-        print(json.dumps(choose(args.name)))
+        machine = choose(args.name)
+        machine['runtime'] = runtime(machine)
+        print(json.dumps(machine))
     elif args.action == 'run':
         args.command = args.command[1:] if args.command[:1] == ['--'] else args.command
         return run(args)

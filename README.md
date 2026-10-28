@@ -49,6 +49,8 @@ belongs to the cloud milestone, not discovery.
 Use the logical name with `--on`; use its `host` alias with SSH.
 `resolve NAME` returns one reachable approved machine as JSON, including its
 `host` alias and capacity. Consumers use this for enrollment without guessing IPs.
+Its `runtime` gives rootless status, resolved cache/container storage paths and
+their live `cache_free_bytes`/`graph_free_bytes`, for the caller's storage policy.
 
 ```sh
 tailworker image send IMAGE --to MACHINE
