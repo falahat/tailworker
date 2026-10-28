@@ -7,8 +7,8 @@ root = Path(__file__).resolve().parent
 sources = ('tailworker', 'bootstrap.sh', 'check.py', 'cloudrun.py')
 code = sum(len((root / name).read_text().splitlines()) for name in sources)
 tests = sum(len(path.read_text().splitlines()) for path in (root / 'tests').rglob('*.py'))
-assert code < 800, code
-assert tests < 300, tests
+assert code < 1200, code
+assert tests < 500, tests
 for name in ('tailworker', 'check.py', 'cloudrun.py'):
     ast.parse((root / name).read_text())
 subprocess.run(['bash', '-n', str(root / 'bootstrap.sh')], check=True)

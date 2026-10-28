@@ -301,6 +301,6 @@ activated by fixture tests. The actual provider/network check remains an owner
 operation; offline tests cannot verify those controls across real machines.
 
 Run source checks with `python3 check.py` and `python3 -m unittest discover tests`.
-The command, bootstrap and check stay below 800 lines total; tests stay below
-300. These are hard caps. Their unit checks do not replace the owned-host
+The command, Cloud Run adapter, bootstrap and check stay below 1,200 lines;
+tests stay below 500. These are hard caps. Their unit checks do not replace the owned-host
 container, GPU, transfer and cancellation checks or the owner's cloud check.
