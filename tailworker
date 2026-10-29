@@ -373,7 +373,10 @@ base.mkdir(mode=0o700,parents=True,exist_ok=True)
 (base/(sys.argv[1]+'.cancel')).touch()
 pid = base/(sys.argv[1]+'.pid')
 if pid.exists():
-    os.kill(int(pid.read_text()),signal.SIGINT)
+    number = int(pid.read_text())
+    if sys.argv[1].encode() not in pathlib.Path('/proc',str(number),'cmdline').read_bytes().split(b'\0'):
+        raise ValueError('cancellation PID no longer belongs to this invocation')
+    os.kill(number,signal.SIGINT)
 '''
 
 
