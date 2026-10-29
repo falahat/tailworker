@@ -423,8 +423,7 @@ def run(args):
 
 def image_send(args):
     machine = choose(args.to)
-    source = ['docker'] if args.from_docker else ['podman']
-    identifier = subprocess.check_output(source + ['image', 'inspect', '--format', '{{.Id}}', args.image], text=True).strip().removeprefix('sha256:')
+    identifier = subprocess.check_output(['podman', 'image', 'inspect', '--format', '{{.Id}}', args.image], text=True).strip().removeprefix('sha256:')
     try:
         existing = output(machine['host'], ['podman', 'image', 'inspect', '--format', '{{.Id}}', args.image]).removeprefix('sha256:')
     except subprocess.CalledProcessError:
@@ -432,7 +431,7 @@ def image_send(args):
     if existing == identifier:
         print('image cached=' + identifier)
         return
-    pipe(source + ['save', args.image], command(machine['host'], ['bash', '-o', 'pipefail', '-c', 'zstd -q -d -c | podman load']))
+    pipe(['podman', 'save', args.image], command(machine['host'], ['bash', '-o', 'pipefail', '-c', 'zstd -q -d -c | podman load']))
     if output(machine['host'], ['podman', 'image', 'inspect', '--format', '{{.Id}}', args.image]).removeprefix('sha256:') != identifier:
         raise ValueError('transferred image identity differs')
 
@@ -623,7 +622,6 @@ def main():
     send = images.add_parser('send')
     send.add_argument('image')
     send.add_argument('--to', required=True)
-    send.add_argument('--from', choices=['docker'], dest='source')
     create = commands.add_parser('up')
     create.add_argument('provider', choices=['gcp'])
     create.add_argument('--name', required=True)
@@ -654,7 +652,6 @@ def main():
         args.command = args.command[1:] if args.command[:1] == ['--'] else args.command
         return run(args)
     elif args.action == 'image':
-        args.from_docker = args.source == 'docker'
         image_send(args)
     else:
         import fcntl

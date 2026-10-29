@@ -119,8 +119,7 @@ the first reachable one with the pinned image, rootless Podman, GPU if needed,
 CPU/memory capacity, real mounts and sufficient free storage on every involved
 filesystem. There is no failover after execution starts. Images must already
 exist: `image send` compares image IDs and transfers only missing images using
-`save | zstd | ssh | load`. Its owner-only `--from docker` can read an existing
-image using current permissions; it never escalates privileges.
+`podman save | zstd | ssh | podman load`, using only rootless Podman.
 
 Execution preserves stdin, stdout, stderr and the container's exit status.
 Every run uses a read-only root, no network, dropped capabilities,
