@@ -119,6 +119,10 @@ class Core(unittest.TestCase):
         value = 'machines=["worker"]\nimage="sha256:'+'a'*64+'"\ncpus=1\nmemory_bytes=1024\nmin_free_bytes=1\nworkdir="/work"\nmounts=[]\n'
         tw.save(path,value)
         self.assertEqual(tw.profile(path)['machines'],['worker'])
+        for installed, expected in (('/tools/pwsh','/tools/pwsh'),(None,'powershell')):
+            with mock.patch.object(tw.os,'name','nt'), mock.patch.object(tw.shutil,'which',return_value=installed), mock.patch.object(tw.subprocess,'run') as acl:
+                self.assertEqual(tw.profile(path)['machines'],['worker'])
+                self.assertEqual(acl.call_args.args[0][0],expected)
         for change in ('[env]\nTAILWORKER_MANAGED="1"\n','unexpected=true\n'):
             path.write_text(value+change)
             with self.assertRaises(ValueError):

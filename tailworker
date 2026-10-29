@@ -245,7 +245,7 @@ def profile(path):
         script = "$ErrorActionPreference='Stop';$p='" + str(path).replace("'", "''") + "';$me=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;"
         script += "$stop='" + str(CONFIG.parent).replace("'", "''") + "';$ok=@($me,'S-1-5-18','S-1-5-32-544');while($p){$a=Get-Acl -LiteralPath $p;if($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $ok){exit 1};"
         script += "foreach($r in $a.Access){if($r.AccessControlType -eq 'Allow' -and ([int]$r.FileSystemRights -band 852310) -and $r.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -notin $ok){exit 1}};if($p -eq $stop){break};$p=Split-Path -Parent $p}"
-        subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+        subprocess.run([shutil.which('pwsh') or 'powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand',
                         base64.b64encode(script.encode('utf-16le')).decode()], check=True, stdout=subprocess.DEVNULL)
     else:
         for item in (path, *path.parents):
