@@ -9,19 +9,17 @@ import argparse
 import base64
 from datetime import datetime, timedelta, timezone
 import getpass
-import hashlib
-import io
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import shutil
 import socket
 import stat
 import subprocess
-import tarfile
 import tempfile
 import time
 import tomllib
@@ -32,7 +30,6 @@ import uuid
 
 HOME = Path.home()
 CONFIG = Path(os.environ.get('XDG_CONFIG_HOME', HOME / '.config')) / 'tailworker'
-CACHE = Path(os.environ.get('XDG_CACHE_HOME', HOME / '.cache')) / 'tailworker'
 LOCKS = '/var/lib/tailworker/locks'
 SSH_OPTIONS = ['-T', '-x', '-oBatchMode=yes', '-oStrictHostKeyChecking=yes', '-oPreferredAuthentications=publickey',
                '-oIdentitiesOnly=yes', '-oForwardAgent=no', '-oClearAllForwardings=yes', '-oPermitLocalCommand=no',
@@ -226,24 +223,6 @@ print(json.dumps(dict(rootless=info['host']['security']['rootless'],graph_root=g
     return json.loads(output(machine['host'], ['python3', '-c', script]))
 
 
-def archive_inputs(directory, destination):
-    directory = directory.resolve(strict=True)
-    if not directory.is_dir():
-        raise ValueError('input must be a directory')
-    with tarfile.open(destination, 'w', format=tarfile.PAX_FORMAT) as archive:
-        for path in sorted(directory.rglob('*')):
-            if path.is_symlink() or not (path.is_file() or path.is_dir()):
-                raise ValueError('inputs must contain only regular files and directories')
-            info = archive.gettarinfo(str(path), arcname=path.relative_to(directory).as_posix())
-            info.uid = info.gid = info.mtime = 0
-            info.uname = info.gname = ''
-            info.pax_headers = {}
-            with path.open('rb') if path.is_file() else io.BytesIO() as stream:
-                archive.addfile(info, stream if path.is_file() else None)
-    with destination.open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
-
-
 def pipe(source, destination):
     with subprocess.Popen(source, stdout=subprocess.PIPE) as producer:
         with subprocess.Popen(['zstd', '-q', '-T1', '-c'], stdin=producer.stdout, stdout=subprocess.PIPE) as compressor:
@@ -256,167 +235,187 @@ def pipe(source, destination):
                 raise ValueError('source or compression failed during transfer')
 
 
-def cache_inputs(host, directory):
-    CACHE.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=CACHE) as temporary:
-        archive = Path(temporary) / 'input.tar'
-        digest = archive_inputs(directory, archive)
-        base = output(host, ['python3', '-c', 'import os; from pathlib import Path; print((Path(os.environ.get("XDG_CACHE_HOME",Path.home()/".cache"))/"tailworker").resolve())'])
-        path = base + '/inputs/' + digest
-        if subprocess.run(command(host, ['test', '-d', path])).returncode == 0:
-            print('input cached=' + digest, flush=True)
-        else:
-            stage = path + '-' + uuid.uuid4().hex
-            script = ('set -e; mkdir -p ' + shlex.quote(stage) + '; tar -xf - -C ' +
-                      shlex.quote(stage) + '; mv -T ' + shlex.quote(stage) + ' ' + shlex.quote(path))
-            with archive.open('rb') as stream:
-                call(host, ['bash', '-o', 'pipefail', '-c', script], stdin=stream)
-            print('input sent=' + digest, flush=True)
-        call(host, ['touch', path])
-        return path
+def profile(path):
+    base = CONFIG / 'profiles'
+    path = path.expanduser().absolute()
+    if path != path.resolve(strict=True) or not path.is_relative_to(base.resolve()) or not path.is_file():
+        raise ValueError('profile must be a regular file under the owner configuration profiles directory')
+    if os.name == 'nt':
+        # Native ACLs, rather than Windows' emulated POSIX mode bits, protect policy.
+        script = "$ErrorActionPreference='Stop';$p='" + str(path).replace("'", "''") + "';$me=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;"
+        script += "$stop='" + str(CONFIG.parent).replace("'", "''") + "';$ok=@($me,'S-1-5-18','S-1-5-32-544');while($p){$a=Get-Acl -LiteralPath $p;"
+        script += "foreach($r in $a.Access){if($r.AccessControlType -eq 'Allow' -and ([int]$r.FileSystemRights -band 852310) -and $r.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -notin $ok){exit 1}};if($p -eq $stop){break};$p=Split-Path -Parent $p}"
+        subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+                        base64.b64encode(script.encode('utf-16le')).decode()], check=True, stdout=subprocess.DEVNULL)
+    else:
+        for item in (path, *path.parents):
+            if item.stat().st_uid != os.getuid() or item.stat().st_mode & 0o022:
+                raise ValueError('profile and its parents must not be writable by other users')
+            if item == CONFIG.parent:
+                break
+    value = tomllib.loads(path.read_text())
+    required = {'machines', 'image', 'cpus', 'memory_bytes', 'min_free_bytes', 'workdir', 'mounts'}
+    if not required <= value.keys() or value.keys() - required - {'gpu', 'env'}:
+        raise ValueError('profile has missing or unknown settings')
+    if not isinstance(value['machines'], list) or not value['machines'] or any(not isinstance(name, str) or not re.fullmatch('[a-z][a-z0-9-]*', name) for name in value['machines']):
+        raise ValueError('profile requires explicit approved machine names')
+    if not re.fullmatch('sha256:[0-9a-f]{64}', value['image']) or any(type(value[key]) is not int or value[key] <= 0 for key in ('cpus', 'memory_bytes', 'min_free_bytes')):
+        raise ValueError('profile requires an immutable image and positive resource limits')
+    if type(value.get('gpu', False)) is not bool or not isinstance(value.get('env', {}), dict):
+        raise ValueError('invalid GPU or environment settings')
+    for key, item in value.get('env', {}).items():
+        if not re.fullmatch('[A-Za-z_][A-Za-z0-9_]*', key) or key.startswith('TAILWORKER_') or not isinstance(item, str) or '\0' in item:
+            raise ValueError('invalid or reserved public environment setting')
+    if not isinstance(value['mounts'], list):
+        raise ValueError('profile requires explicit persistent mounts')
+    paths = [value['workdir']]
+    for mount in value['mounts']:
+        if set(mount) != {'source', 'target', 'read_only'} or type(mount['read_only']) is not bool:
+            raise ValueError('each mount requires source, target and read_only')
+        paths.extend((mount['source'], mount['target']))
+    if any(not isinstance(item, str) or not item.startswith('/') or any(part in ('', '.', '..') for part in item[1:].split('/')) or any(c in item for c in ':,\0\n') for item in paths):
+        raise ValueError('mounts and workdir require normalized absolute Linux paths')
+    targets = [mount['target'] for mount in value['mounts']]
+    if len(set(targets)) != len(targets) or any(target.split('/')[1] in ('run', 'proc', 'sys', 'dev') for target in targets):
+        raise ValueError('mount targets must be unique and outside reserved system directories')
+    return value
 
 
-RUN = '''import fcntl,json,os,pathlib,signal,subprocess,sys,time
+EXEC = r'''import fcntl,json,os,pathlib,signal,shutil,subprocess,sys
 os.umask(0o077)
-locks, receipt, gpu, container = sys.argv[1:5]
-path = pathlib.Path(receipt)
-path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-pid = path.with_suffix('.pid')
-child = acquired = None
+p, identifier, mode = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3]
+info = json.loads(subprocess.check_output(['podman','info','--format','json']))
+if not info['host']['security']['rootless'] or p['cpus'] > os.cpu_count() or p['memory_bytes'] > os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE'):
+    raise ValueError('worker lacks rootless Podman or requested resources')
+image = subprocess.check_output(['podman','image','inspect','--format','{{.Id}}',p['image']],text=True).strip()
+if 'sha256:' + image.removeprefix('sha256:') != p['image']:
+    raise ValueError('approved image is unavailable')
+if p.get('gpu') and not json.loads(pathlib.Path('/var/lib/tailworker/capacity.json').read_text())['gpu_name']:
+    raise ValueError('worker has no admitted GPU')
+home = pathlib.Path.home()
+control = pathlib.Path(os.environ.get('XDG_RUNTIME_DIR',home/'.local/state'))/'tailworker'
+graph = pathlib.Path(info['store']['graphRoot']).resolve()
+protected = [pathlib.Path(item) for item in ('/etc','/proc','/sys','/dev','/run','/var/run','/root')]
+protected += [home/'.ssh',home/'.aws',home/'.kube',home/'.config',home/'.local/share/containers',
+              pathlib.Path(os.environ.get('XDG_CONFIG_HOME',home/'.config'))/'tailworker',control,graph]
+flags = ['--rm','--interactive','--name',identifier,'--pull=never','--userns=keep-id',
+         '--cpus',str(p['cpus']),'--memory',str(p['memory_bytes']),'--memory-swap',str(p['memory_bytes']),
+         '--read-only','--cap-drop=all','--security-opt=no-new-privileges','--network=none',
+         '--tmpfs','/tmp:rw,nosuid,nodev,size=1g','--tmpfs','/run:rw,nosuid,nodev,size=64m','--workdir',p['workdir']]
+for mount in p['mounts']:
+    source = pathlib.Path(mount['source'])
+    if source.resolve(strict=True) != source or not (source.is_file() or source.is_dir()) or any(source == item or source in item.parents or item in source.parents for item in protected):
+        raise ValueError('mount must be a real data path outside host control and credential locations')
+    if any(part.lower() in ('.ssh','.aws','.kube','.config','secrets','credentials') for part in source.parts):
+        raise ValueError('credential mounts are forbidden')
+    if shutil.disk_usage(source).free < p['min_free_bytes']:
+        raise ValueError('mount filesystem is below the free-space floor')
+    flags += ['-v',str(source) + ':' + mount['target'] + (':ro' if mount['read_only'] else ':rw') + ',rprivate,nosuid,nodev']
+if shutil.disk_usage(graph).free < p['min_free_bytes']:
+    raise ValueError('container storage is below the free-space floor')
+for key, value in p.get('env',{}).items():
+    flags += ['-e',key + '=' + value]
+flags += ['-e','TAILWORKER_MANAGED=1']
+if p.get('gpu',False):
+    flags += ['--device','nvidia.com/gpu=all','-v','/var/lib/tailworker/locks/gpu:/run/tailworker/gpu.lock:ro',
+              '-e','TAILWORKER_GPU_LEASE_FD=3','-e','TAILWORKER_GPU_LEASE_PATH=/run/tailworker/gpu.lock']
+if mode == 'check':
+    sys.exit(0)
+control.mkdir(mode=0o700,parents=True,exist_ok=True)
+pid, cancelled_file = control/(identifier+'.pid'), control/(identifier+'.cancel')
+child = None
 launching = cancelled = False
 def cancel(*unused):
     global cancelled
     cancelled = True
     if not launching:
         raise KeyboardInterrupt
-signal.signal(signal.SIGINT, cancel)
-started = time.monotonic()
+for sig in (signal.SIGINT,signal.SIGTERM):
+    signal.signal(sig,cancel)
 try:
     pid.write_text(str(os.getpid()))
-    if path.with_suffix('.cancel').exists():
+    if cancelled_file.exists():
         raise KeyboardInterrupt
-    if gpu == '1':
-        want = os.open(locks + '/gpu.want', os.O_RDONLY)
-        fcntl.flock(want, fcntl.LOCK_EX)
-        lease = os.open(locks + '/gpu', os.O_RDONLY)
-        fcntl.flock(lease, fcntl.LOCK_EX)
+    if p.get('gpu',False):
+        want = os.open('/var/lib/tailworker/locks/gpu.want',os.O_RDONLY)
+        fcntl.flock(want,fcntl.LOCK_EX)
+        lease = os.open('/var/lib/tailworker/locks/gpu',os.O_RDONLY)
+        fcntl.flock(lease,fcntl.LOCK_EX)
         os.close(want)
-        os.dup2(lease, 3, inheritable=True)
+        os.dup2(lease,3,inheritable=True)
         if lease != 3:
             os.close(lease)
-    acquired = time.monotonic()
     launching = True
-    child = subprocess.Popen(['podman', 'run', *(['--preserve-fds=1'] if gpu == '1' else []), *sys.argv[5:]], pass_fds=(3,) if gpu == '1' else ())
+    child = subprocess.Popen(['podman','run',*(['--preserve-fds=1'] if p.get('gpu',False) else []),*flags,p['image'],*sys.argv[4:]],pass_fds=(3,) if p.get('gpu',False) else ())
     launching = False
     if cancelled:
         raise KeyboardInterrupt
     result = child.wait()
 except KeyboardInterrupt:
     if child:
-        if child.poll() is None:
-            child.terminate()
+        stopped = subprocess.run(['podman','kill',identifier],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        if stopped.returncode and child.poll() is None:
+            raise ValueError('container cancellation could not be confirmed')
         child.wait()
-        subprocess.run(['podman', 'stop', container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     result = 130
 finally:
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGINT,signal.SIG_IGN)
+    signal.signal(signal.SIGTERM,signal.SIG_IGN)
     pid.unlink(missing_ok=True)
-    path.with_suffix('.cancel').unlink(missing_ok=True)
-finished = time.monotonic()
-with path.open('x') as stream:
-    json.dump(dict(gpu_lock_wait_seconds=(acquired or finished) - started if gpu == '1' else 0,
-                   execution_seconds=finished - acquired if acquired else 0, exit_code=result), stream)
+    cancelled_file.unlink(missing_ok=True)
 sys.exit(result)
 '''
 
-PRUNE = '''import os,pathlib,re,shutil,subprocess,json,time
-base=(pathlib.Path(os.environ.get('XDG_CACHE_HOME',pathlib.Path.home()/'.cache'))/'tailworker/inputs').resolve()
-if base.exists():
-    running=subprocess.check_output(['podman','ps','-q'],text=True).split()
-    containers=json.loads(subprocess.check_output(['podman','inspect',*running])) if running else []
-    active={mount['Source'] for item in containers for mount in item.get('Mounts',[])}
-    for path in base.iterdir():
-        if re.fullmatch('[0-9a-f]{64}',path.name) and path.is_dir() and not path.is_symlink():
-            if str(path) not in active and path.stat().st_mtime<time.time()-7*86400:
-                assert path.resolve().parent==base.resolve()
-                shutil.rmtree(path)
+
+CANCEL = '''import os,pathlib,signal,sys
+base = pathlib.Path(os.environ.get('XDG_RUNTIME_DIR',pathlib.Path.home()/'.local/state'))/'tailworker'
+base.mkdir(mode=0o700,parents=True,exist_ok=True)
+(base/(sys.argv[1]+'.cancel')).touch()
+pid = base/(sys.argv[1]+'.pid')
+if pid.exists():
+    os.kill(int(pid.read_text()),signal.SIGINT)
 '''
-
-
-def unpack_outputs(archive, target):
-    target.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(archive) as contents:
-        for item in contents:
-            path = target / item.name
-            if (not item.isdir() and not item.isfile()) or not path.resolve().is_relative_to(target.resolve()):
-                raise ValueError('worker output contains a link, special file or escaping path')
-        contents.extractall(target, filter='data')
 
 
 def run(args):
     if not args.command:
         raise ValueError('run requires a command after --')
-    if args.out and args.out.exists() and (not args.out.is_dir() or any(args.out.iterdir())):
-        raise ValueError('output directory must be empty or absent')
-    if args.receipt and (args.receipt.exists() or args.receipt.is_symlink() or
-                         (args.out and args.receipt.resolve().is_relative_to(args.out.resolve()))):
-        raise ValueError('receipt must be new and outside the output directory')
-    machine = choose(args.on, args.gpu)
-    host = machine['host']
-    if output(host, ['podman', 'info', '--format', '{{.Host.Security.Rootless}}']) != 'true':
-        raise ValueError('worker Podman must be rootless')
-    try:
-        image = 'sha256:' + output(host, ['podman', 'image', 'inspect', '--format', '{{.Id}}', args.image]).removeprefix('sha256:')
-    except subprocess.CalledProcessError:
-        raise ValueError('missing image; run tailworker image send ' + args.image + ' --to ' + machine['name']) from None
-    if not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
-        raise ValueError('worker returned an invalid image identity')
-    call(host, ['python3', '-c', PRUNE])
+    value = profile(args.profile)
+    found = {machine['name']: machine for machine in machines(settings())}
+    aliases(list(found.values()))
     identifier = 'tw-' + uuid.uuid4().hex
-    memory = args.memory or str(machine['capacity']['memory_bytes'] * 4 // 5)
-    flags = ['--rm', '--name', identifier, '--pull=never', '--userns=keep-id', '--memory', memory,
-             '--read-only', '--cap-drop=all', '--security-opt=no-new-privileges',
-             '--tmpfs', '/tmp:rw,nosuid,nodev,size=1g', '--tmpfs', '/run:rw,nosuid,nodev,size=64m',
-             '--network', 'pasta' if args.net else 'none']
-    if args.inputs:
-        flags += ['-v', cache_inputs(host, args.inputs) + ':/in:ro']
-    remote_out = None
-    if args.out:
-        base = output(host, ['python3', '-c', 'import os; from pathlib import Path; p=Path(os.environ.get("XDG_CACHE_HOME",Path.home()/".cache"))/"tailworker/outputs"; p.mkdir(parents=True,exist_ok=True); print(p.resolve())'])
-        remote_out = output(host, ['mktemp', '-d', base + '/' + identifier + '.XXXXXXXX'])
-        flags += ['-v', remote_out + ':/out:rw']
-    if args.gpu:
-        flags += ['--device', 'nvidia.com/gpu=all', '-v', LOCKS + ':' + LOCKS + ':ro', '-e', 'TAILWORKER_GPU_LEASE_FD=3']
-    receipt = output(host, ['python3', '-c', 'import os,pathlib,sys; print(pathlib.Path(os.environ.get("XDG_CACHE_HOME",pathlib.Path.home()/".cache"))/"tailworker/receipts"/sys.argv[1])', identifier + '.json'])
-    launched = command(host, ['python3', '-c', RUN, LOCKS, receipt, '1' if args.gpu else '0', identifier, *flags, image, *args.command])
-    print('machine=' + machine['name'] + ' container=' + identifier, flush=True)
-    process = None
+    for name in value['machines']:
+        machine = found.get(name)
+        if machine is None or not machine['online']:
+            continue
+        invocation = ['python3','-c',EXEC,json.dumps(value),identifier]
+        try:
+            call(machine['host'], [*invocation,'check'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            break
+        except subprocess.CalledProcessError:
+            continue
+    else:
+        raise ValueError('no approved machine passed environment preflight')
+    print('machine=' + name + ' container=' + identifier, file=sys.stderr, flush=True)
+    process = subprocess.Popen(command(machine['host'], [*invocation,'run',*args.command]),
+                               start_new_session=os.name == 'posix',
+                               creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0)
+    def interrupt(*unused):
+        raise KeyboardInterrupt
+    previous = signal.signal(signal.SIGTERM, interrupt)
+    previous_int = signal.getsignal(signal.SIGINT)
     try:
-        process = subprocess.Popen(launched)
-        result = process.wait()
+        return process.wait()
     except KeyboardInterrupt:
-        stopped = subprocess.run(command(host, ['python3', '-c', 'import os,pathlib,signal,sys; p=pathlib.Path(sys.argv[1]); p.with_suffix(".cancel").touch(); p=p.with_suffix(".pid"); os.kill(int(p.read_text()),signal.SIGINT) if p.exists() else None', receipt]), stdout=subprocess.DEVNULL)
-        if stopped.returncode:
-            print('Could not confirm cancellation of ' + identifier + ' on ' + machine['name'], file=sys.stderr)
-        if process:
-            process.wait()
-        result = 130
-    if args.receipt:
-        value = json.loads(output(host, ['cat', receipt]))
-        value.update(machine=machine['name'], host=host, image_id=image, container=identifier, gpu=args.gpu)
-        args.receipt.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with os.fdopen(os.open(args.receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as stream:
-            stream.write(json.dumps(value, sort_keys=True) + '\n')
-    call(host, ['python3', '-c', 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); done=p.exists(); p.unlink(missing_ok=True); p.with_suffix(".cancel").unlink(missing_ok=True) if done else None', receipt])
-    if remote_out:
-        CACHE.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=CACHE) as temporary:
-            archive = Path(temporary) / 'output.tar'
-            with archive.open('wb') as stream:
-                call(host, ['tar', '-cf', '-', '-C', remote_out, '.'], stdout=stream)
-            unpack_outputs(archive, args.out)
-        call(host, ['python3', '-c', 'import pathlib,shutil,sys; p=pathlib.Path(sys.argv[1]); assert p.parent.name=="outputs" and p.name.startswith("tw-") and p.resolve()==p; shutil.rmtree(p)', remote_out])
-    return result
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        call(machine['host'], ['python3','-c',CANCEL,identifier], stdout=subprocess.DEVNULL)
+        if process.wait() != 130:
+            raise ValueError('run cancellation could not be confirmed')
+        return 130
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        signal.signal(signal.SIGINT, previous_int)
 
 
 def image_send(args):
@@ -615,14 +614,7 @@ def main():
     transport.add_argument('--config', type=Path)
     transport.add_argument('--null', action='store_true')
     run_parser = commands.add_parser('run')
-    run_parser.add_argument('--on')
-    run_parser.add_argument('--gpu', action='store_true')
-    run_parser.add_argument('--image', required=True)
-    run_parser.add_argument('--in', dest='inputs', type=Path)
-    run_parser.add_argument('--out', type=Path)
-    run_parser.add_argument('--net', action='store_true')
-    run_parser.add_argument('--memory')
-    run_parser.add_argument('--receipt', type=Path)
+    run_parser.add_argument('--profile', required=True, type=Path)
     run_parser.add_argument('command', nargs=argparse.REMAINDER)
     images = commands.add_parser('image').add_subparsers(dest='image_action', required=True)
     send = images.add_parser('send')

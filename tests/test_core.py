@@ -64,22 +64,6 @@ class Core(unittest.TestCase):
         self.assertEqual(json.loads(captured.getvalue()), machine)
         self.assertTrue(machine['runtime']['rootless'])
 
-    def test_input_identity_ignores_times_and_roundtrips_three_files(self):
-        source = self.root / 'source'
-        (source / 'nested').mkdir(parents=True)
-        values = {'first': b'\0\x01sample', 'second': b'other\n', 'nested/third': b'xyz'}
-        for name, content in values.items():
-            (source / name).write_bytes(content)
-        archive = self.root / 'first.tar'
-        identity = tw.archive_inputs(source, archive)
-        os.utime(source / 'first', (1234, 1234))
-        self.assertEqual(identity, tw.archive_inputs(source, self.root / 'second.tar'))
-        result = self.root / 'result'
-        tw.unpack_outputs(archive, result)
-        self.assertEqual({name: (result / name).read_bytes() for name in values}, values)
-        (source / 'first').write_bytes(b'changed')
-        self.assertNotEqual(identity, tw.archive_inputs(source, self.root / 'changed.tar'))
-
     def test_owned_order_offline_and_gpu_selection(self):
         found = [dict(name='cpu', host='local', capacity=dict(gpu_name='')),
                  dict(name='offline', capacity=None),
@@ -107,102 +91,105 @@ class Core(unittest.TestCase):
             self.assertEqual((config / 'known_hosts').read_text(), pins)
             self.assertEqual((config / 'known_hosts').stat().st_mode & 0o777, 0o600)
 
-    def test_gpu_descriptor_keeps_native_lock_until_process_exits(self):
-        locks = self.root / 'locks'
-        locks.mkdir()
-        for name in ('gpu', 'gpu.want'):
-            (locks / name).touch()
+    def environment(self, gpu=False):
+        source = self.root / 'data'
+        source.mkdir(exist_ok=True)
+        graph = self.root / 'graph'
+        graph.mkdir(exist_ok=True)
+        value = dict(machines=['worker'], image='sha256:'+'a'*64, cpus=1, memory_bytes=1024,
+                     min_free_bytes=1, workdir='/work', gpu=gpu, env={'PUBLIC':'value'},
+                     mounts=[dict(source=str(source),target='/work',read_only=False)])
+        self.enterContext(mock.patch.dict(os.environ, XDG_RUNTIME_DIR=str(self.root/'runtime')))
         binary = self.root / 'bin'
-        binary.mkdir()
+        binary.mkdir(exist_ok=True)
         executable = binary / 'podman'
-        executable.write_text('#!' + sys.executable + '\nimport json,os,sys\n'
-                              'print(json.dumps(dict(args=sys.argv[1:],fd=os.fstat(3).st_ino)),flush=True)\n'
-                              'sys.stdin.read(1)\n')
+        executable.write_text('#!'+sys.executable+'\nimport json,os,signal,sys\nfrom pathlib import Path\n'
+                              'if sys.argv[1]=="info": print('+repr(json.dumps(dict(host=dict(security=dict(rootless=True)),store=dict(graphRoot=str(graph)))))+')\n'
+                              'elif sys.argv[1]=="image": print("sha256:"+"a"*64)\n'
+                              'elif sys.argv[1]=="kill": os.kill(int((Path(os.environ["XDG_RUNTIME_DIR"])/"container.pid").read_text()),signal.SIGTERM)\n'
+                              'elif sys.argv[1]=="run":\n (Path(os.environ["XDG_RUNTIME_DIR"])/"container.pid").write_text(str(os.getpid()))\n print(json.dumps(dict(args=sys.argv[1:],fd=os.fstat(3).st_ino if "--preserve-fds=1" in sys.argv else None)),flush=True)\n sys.stdin.read(1)\n sys.exit(int(os.environ.get("FAKE_EXIT","0")))\n')
         executable.chmod(0o700)
-        receipt = self.root / 'receipt.json'
-        with mock.patch.dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH']):
-            process = subprocess.Popen([sys.executable, '-c', tw.RUN, str(locks), str(receipt), '1', 'own', '--rm', 'image', 'true'],
-                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-            try:
-                ready = json.loads(process.stdout.readline())
-                self.assertEqual(ready['fd'], (locks / 'gpu').stat().st_ino)
-                self.assertEqual(ready['args'][:2], ['run', '--preserve-fds=1'])
-                waiting = self.root / 'waiting.json'
-                waiter = subprocess.Popen([sys.executable, '-c', tw.RUN, str(locks), str(waiting), '1', 'waiting', 'true'], stdout=subprocess.PIPE)
-                while not waiting.with_suffix('.pid').exists():
-                    time.sleep(0.01)
-                waiter.send_signal(signal.SIGINT)
-                self.assertEqual((waiter.communicate()[0], waiter.returncode), (b'', 130))
-                self.assertEqual(json.loads(waiting.read_text())['execution_seconds'], 0)
-                with (locks / 'gpu').open() as lock:
-                    with self.assertRaises(BlockingIOError):
-                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                process.communicate('x')
-                self.assertEqual(process.returncode, 0)
-                self.assertEqual(json.loads(receipt.read_text())['exit_code'], 0)
-            finally:
-                if process.poll() is None:
-                    process.terminate()
-                process.wait()
-        with (locks / 'gpu').open() as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.enterContext(mock.patch.dict(os.environ,PATH=str(binary)+os.pathsep+os.environ['PATH']))
+        return value
 
-    def test_cache_hit_sends_no_input(self):
-        source = self.root / 'source'
-        source.mkdir()
-        (source / 'file').write_text('content')
-        with mock.patch.object(tw, 'CACHE', self.root / 'cache'), mock.patch.object(tw, 'output', return_value='/work/cache'), mock.patch.object(tw, 'call') as call, mock.patch.object(tw, 'pipe') as pipe, mock.patch.object(tw.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), mock.patch('sys.stdout', io.StringIO()):
-            path = tw.cache_inputs('local', source)
-        pipe.assert_not_called()
-        self.assertRegex(path, r'/inputs/[0-9a-f]{64}$')
-        call.assert_called_once_with('local', ['touch', path])
+    def test_profile_policy_is_confined_and_reserved_settings_cannot_be_overridden(self):
+        config = self.root / 'config'
+        self.enterContext(mock.patch.object(tw,'CONFIG',config))
+        path = config / 'profiles' / 'worker.toml'
+        value = 'machines=["worker"]\nimage="sha256:'+'a'*64+'"\ncpus=1\nmemory_bytes=1024\nmin_free_bytes=1\nworkdir="/work"\nmounts=[]\n'
+        tw.save(path,value)
+        self.assertEqual(tw.profile(path)['machines'],['worker'])
+        for change in ('[env]\nTAILWORKER_MANAGED="1"\n','unexpected=true\n'):
+            path.write_text(value+change)
+            with self.assertRaises(ValueError):
+                tw.profile(path)
+        path.write_text(value)
+        path.chmod(0o666)
+        with self.assertRaisesRegex(ValueError,'writable'):
+            tw.profile(path)
+        path.chmod(0o600)
+        outside = self.root/'outside.toml'
+        outside.write_text(value)
+        with self.assertRaisesRegex(ValueError,'owner configuration'):
+            tw.profile(outside)
 
-    def test_pruning_removes_old_inputs_but_keeps_active_mounts_and_fresh_inputs(self):
-        cache = self.root / 'tailworker' / 'inputs'
-        old, active, fresh = [cache / (letter * 64) for letter in 'abc']
-        for directory in (old, active, fresh):
-            directory.mkdir(parents=True)
-            (directory / 'input').write_text('data')
-        expired = time.time() - 8 * 86400
-        for directory in (old, active):
-            os.utime(directory, (expired, expired))
-        binary = self.root / 'bin'
-        binary.mkdir()
-        podman = binary / 'podman'
-        podman.write_text('#!' + sys.executable + '\nimport json,sys\n'
-                          'print("container" if sys.argv[1]=="ps" else json.dumps('
-                          + repr([dict(Mounts=[dict(Source=str(active))])]) + '))\n')
-        podman.chmod(0o700)
-        environment = dict(os.environ, XDG_CACHE_HOME=str(self.root),
-                           PATH=str(binary) + os.pathsep + os.environ['PATH'])
-        subprocess.run([sys.executable, '-c', tw.PRUNE], env=environment, check=True)
-        self.assertFalse(old.exists())
-        self.assertTrue((active / 'input').is_file())
-        self.assertTrue((fresh / 'input').is_file())
+    def test_environment_uses_persistent_mounts_and_fixed_isolation(self):
+        value = self.environment()
+        result = subprocess.run([sys.executable,'-c',tw.EXEC,json.dumps(value),'tw-own','run','sh','-c','exit 23'],input=b'x',stdout=subprocess.PIPE,check=True)
+        args = json.loads(result.stdout)['args']
+        for item in ('--interactive','--cpus','--memory','--memory-swap','--read-only','--cap-drop=all','--security-opt=no-new-privileges','--network=none','--pull=never','TAILWORKER_MANAGED=1',str(self.root/'data')+':/work:rw,rprivate,nosuid,nodev'):
+            self.assertIn(item,args)
+        self.assertEqual(args[-4:],[value['image'],'sh','-c','exit 23'])
+        with mock.patch.dict(os.environ,FAKE_EXIT='23'):
+            result = subprocess.run([sys.executable,'-c',tw.EXEC,json.dumps(value),'tw-own','run','true'],input=b'x',stdout=subprocess.PIPE)
+        self.assertEqual(result.returncode,23)
+        for source in ('/etc',str(self.root/'missing')):
+            value['mounts'][0]['source']=source
+            result = subprocess.run([sys.executable,'-c',tw.EXEC,json.dumps(value),'tw-own','check'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            self.assertNotEqual(result.returncode,0)
 
-    def test_offline_run_uses_memory_cap_and_never_pulls(self):
-        args = argparse.Namespace(on=None, gpu=False, image='image', inputs=None, out=None, receipt=self.root / 'receipt.json',
-                                  net=False, memory=None, command=['sh', '-c', 'exit 23'])
-        machine = dict(name='owned', host='local', capacity=dict(memory_bytes=1000))
-        process = mock.Mock()
-        process.wait.return_value = 23
-        image = 'sha256:' + 'a' * 64
-        answers = ['true', image.removeprefix('sha256:'), '/work/receipts/result.json', json.dumps(dict(gpu_lock_wait_seconds=0, execution_seconds=2.5, exit_code=23))]
-        with mock.patch.object(tw, 'choose', return_value=machine), mock.patch.object(tw, 'output', side_effect=answers), mock.patch.object(tw, 'call'), mock.patch.object(tw.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), mock.patch.object(tw.subprocess, 'Popen', return_value=process) as launch, mock.patch('sys.stdout', io.StringIO()):
-            self.assertEqual(tw.run(args), 23)
-        command = launch.call_args.args[0]
-        self.assertEqual(command[command.index('--network') + 1], 'none')
-        self.assertEqual(command[command.index('--memory') + 1], '800')
-        self.assertIn('--pull=never', command)
-        for flag in ('--read-only', '--cap-drop=all', '--security-opt=no-new-privileges', image):
-            self.assertIn(flag, command)
-        receipt = json.loads(args.receipt.read_text())
-        self.assertEqual((receipt['machine'], receipt['host'], receipt['image_id'], receipt['exit_code']), ('owned', 'local', image, 23))
-        self.assertEqual(receipt['execution_seconds'], 2.5)
-        self.assertEqual(receipt['gpu_lock_wait_seconds'], 0)
-        self.assertTrue(receipt['container'].startswith('tw-'))
-        with self.assertRaisesRegex(ValueError, 'receipt must be new'):
-            tw.run(args)
+    def test_gpu_descriptor_and_cancellation_use_the_same_native_lock(self):
+        value = self.environment(gpu=True)
+        (self.root/'capacity.json').write_text('{"gpu_name":"admitted"}')
+        locks = self.root/'locks'
+        locks.mkdir()
+        for name in ('gpu','gpu.want'):
+            (locks/name).touch()
+        script = tw.EXEC.replace('/var/lib/tailworker/locks',str(locks)).replace('/var/lib/tailworker/capacity.json',str(self.root/'capacity.json'))
+        process = subprocess.Popen([sys.executable,'-c',script,json.dumps(value),'tw-own','run','true'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+        try:
+            ready = json.loads(process.stdout.readline())
+            self.assertEqual(ready['fd'],(locks/'gpu').stat().st_ino)
+            self.assertIn('TAILWORKER_GPU_LEASE_PATH=/run/tailworker/gpu.lock',ready['args'])
+            with (locks/'gpu').open() as lock:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            waiter = subprocess.Popen([sys.executable,'-c',script,json.dumps(value),'tw-waiting','run','true'],stdout=subprocess.PIPE)
+            while not (self.root/'runtime/tailworker/tw-waiting.pid').exists():
+                time.sleep(0.01)
+            waiter.send_signal(signal.SIGINT)
+            self.assertEqual((waiter.communicate()[0],waiter.returncode),(b'',130))
+            self.assertFalse((self.root/'runtime/tailworker/tw-waiting.pid').exists())
+            subprocess.run([sys.executable,'-c',tw.CANCEL,'tw-own'],check=True)
+            self.assertEqual(process.wait(),130)
+            process.communicate()
+            self.assertFalse((self.root/'runtime/tailworker/tw-own.pid').exists())
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait()
+
+    def test_only_approved_machines_are_probed_and_execution_is_never_retried(self):
+        value = dict(machines=['offline','first','second'],gpu=False)
+        found = [dict(name=name,host=name,online=capacity is not None) for name,capacity in
+                 [('other',{}),('offline',None),('first',{}),('second',{})]]
+        args = argparse.Namespace(profile=Path('policy'),command=['true'])
+        with mock.patch.object(tw,'profile',return_value=value), mock.patch.object(tw,'settings',return_value={}), mock.patch.object(tw,'machines',return_value=found), mock.patch.object(tw,'aliases'), mock.patch.object(tw,'call',side_effect=[subprocess.CalledProcessError(1,[]),None]) as probe, mock.patch.object(tw,'command',side_effect=lambda host,args:[host,*args]), mock.patch.object(tw.subprocess,'Popen') as launch, contextlib.redirect_stderr(io.StringIO()):
+            launch.return_value.wait.return_value=23
+            self.assertEqual(tw.run(args),23)
+        self.assertEqual([call.args[0] for call in probe.call_args_list],['first','second'])
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.args[0][0],'second')
 
 
 if __name__ == '__main__':

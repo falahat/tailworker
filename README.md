@@ -46,7 +46,7 @@ owner enrollment has established their host pin. Offline aliases disappear;
 their existing pins remain until explicit teardown. First-contact enrollment
 belongs to the cloud milestone, not discovery.
 `ls --json` returns logical names, SSH aliases, availability and capacity.
-Use the logical name with `--on`; use its `host` alias with SSH.
+Profiles approve logical machine names; use a machine's `host` alias with SSH.
 `resolve NAME` returns one reachable approved machine as JSON, including its
 `host` alias and capacity. Consumers use this for enrollment without guessing IPs.
 Its `runtime` gives rootless status, resolved cache/container storage paths and
@@ -66,41 +66,77 @@ submitted work has no deadline or retry.
 
 ```sh
 tailworker image send IMAGE --to MACHINE
-tailworker run --on MACHINE --image IMAGE -- true
-tailworker run --on MACHINE --gpu --image IMAGE -- nvidia-smi
-tailworker run --image IMAGE --in inputs --out results -- COMMAND ARGUMENTS
+tailworker run --profile ~/.config/tailworker/profiles/compute.toml -- python3 /app/process.py
 ```
 
-Without `--on`, run chooses the first reachable owned machine in configuration
-order, then dedicated nodes by name. `--gpu` requires a GPU. An occupied GPU
-waits on its machine's shared lock; there is no scheduler. Images must already
-exist; a missing image names the `image send` command to use. Image transfer
-compares image IDs, then uses `save | zstd | ssh | load` when necessary. The
-owner's `image send --from docker` reads an existing Docker image using the
-caller's existing permissions; it never escalates privileges. An unreachable
-laptop can import from the control host by starting the reverse pipe locally:
-`ssh CONTROL docker save IMAGE | podman load`.
+`run` executes one command in an existing approved environment. The owner keeps
+its public TOML policy under `$XDG_CONFIG_HOME/tailworker/profiles/` (default
+`~/.config/tailworker/profiles/`), outside submitted source and application state.
+Native Windows controllers use the same layout under their home directory.
+Policy and its parent directories must prevent other users from writing them;
+Windows checks native ACLs. The caller chooses the policy, never a queued job.
 
-Inputs are regular files/directories only, packed in sorted order with zero
-timestamps and named by SHA-256. A cache hit sends no input again. Inputs are
-mounted read-only at `/in`. `--out` must be empty or absent and receives the
-job's fresh `/out`; returned links, special files and paths escaping that
-directory are refused. Unused input cache entries expire after seven days.
-Input tar files stream through Python and SSH; Windows callers need no local
-`cat`, `zstd` or `fcntl` for `resolve` and `run` against a Linux machine.
+```toml
+machines = ["workstation", "dedicated"]
+image = "sha256:REPLACE_WITH_64_LOWERCASE_HEX_DIGITS"
+cpus = 4
+memory_bytes = 16000000000
+min_free_bytes = 500000000000
+workdir = "/app"
+gpu = true
 
-Runs use an immutable image ID, a read-only root, dropped capabilities,
-no-new-privileges and writable temporary filesystems. They default to no
-network and 80% of the machine's memory. `--net` opts into
-networking, subject to that machine's host policy; `--memory` overrides the cap.
-The exit status is the container's. Ctrl-C stops only that run's named `tw-*`
-container before returning. Jobs have no timeout and are never retried.
+[env]
+MODEL_ROOT = "/models"
 
-`run --receipt FILE` writes private trusted-host JSON after execution. It
-contains `machine`, `host`, `image_id`, `container`, `gpu`, `exit_code`,
-`gpu_lock_wait_seconds` and `execution_seconds`. Timing uses the worker's
-monotonic clock; execution starts after acquiring the GPU lock. Its staging
-file stays outside the job's mounts. FILE must be new and outside `--out`.
+[[mounts]]
+source = "/srv/compute/code"
+target = "/app"
+read_only = true
+
+[[mounts]]
+source = "/srv/compute/models"
+target = "/models"
+read_only = true
+
+[[mounts]]
+source = "/srv/compute/state"
+target = "/state"
+read_only = false
+```
+
+Declare all sources, models and input data read-only; only explicit output,
+spool and cache trees are writable. Paths must already exist, be normalized
+absolute Linux paths without symlinks, and match on each approved machine.
+The owner admits only public code/data trees: never put credentials or sockets
+inside them. Host control, credential and container-storage mounts are refused.
+Profiles contain no tokens, keys or other secrets; neither command arguments
+nor public environment values may carry credentials. `TAILWORKER_*` variables
+and system mount targets are reserved. Models and data stay in their persistent
+host directories; tailworker never packs, copies, caches or relocates them.
+
+Preflight considers only the profile's ordered approved machines and chooses
+the first reachable one with the pinned image, rootless Podman, GPU if needed,
+CPU/memory capacity, real mounts and sufficient free storage on every involved
+filesystem. There is no failover after execution starts. Images must already
+exist: `image send` compares image IDs and transfers only missing images using
+`save | zstd | ssh | load`. Its owner-only `--from docker` can read an existing
+image using current permissions; it never escalates privileges.
+
+Execution preserves stdin, stdout, stderr and the container's exit status.
+Every run uses a read-only root, no network, dropped capabilities,
+no-new-privileges, private mount propagation, bounded CPU/memory (including
+swap), and writable temporary filesystems. GPU runs wait for the canonical
+shared lease and inherit descriptor 3 plus its read-only inode at
+`/run/tailworker/gpu.lock`. Fixed `TAILWORKER_MANAGED=1`,
+`TAILWORKER_GPU_LEASE_FD=3` and `TAILWORKER_GPU_LEASE_PATH` describe admission;
+GPU variables exist only for GPU runs. Keep application supervisors outside the
+lease: submit one finite unit, then let the application decide what runs next.
+
+Ctrl-C cancels only that invocation's trusted executor and generated `tw-*`
+container, including a wait for the GPU lock; unconfirmed cleanup fails closed.
+Transient PID/cancellation markers stay outside all mounts and are removed by
+the executor. Jobs have no timeout or retry. Tailworker owns no work queue,
+receipts, result database or application state; those belong to the caller.
 
 ## Cloud Run
 
@@ -257,9 +293,9 @@ Every project uses these machines through the layer that matches its jobs:
 
 | Work | Job layer | Project setup | Add a machine |
 |---|---|---|---|
-| Builds, tests, gates and sweeps | ci-buddy | Project configuration, image, fetch secrets | Install the same ci-buddy revision and add its SSH root to the coordinator |
+| Builds, tests, gates and sweeps | ci-buddy | Project configuration, image, fetch secrets | The dispatch remote-runner kit installs and enrolls that machine |
 | Durable application jobs | Its own dispatch plane | Plane node, signer/revoker, runner environment | The dispatch remote-runner kit installs and enrolls that machine |
-| One-off compute | None | Nothing | `tailworker run` |
+| One-off compute | None | Owner-approved environment profile and image | `tailworker run --profile FILE -- COMMAND` |
 
 Projects create no machines or network identities themselves. They supply their
 own container images, honor the GPU lock, keep credentials in their own secret
