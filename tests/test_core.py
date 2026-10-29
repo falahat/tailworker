@@ -30,6 +30,31 @@ class Core(unittest.TestCase):
         with mock.patch.dict(sys.modules, fcntl=None):
             loader.exec_module(tw)
 
+    def test_ssh_policy_pins_all_private_dns_and_preserves_owner_settings(self):
+        config = self.root / 'ssh_config'
+        tw.save(config, 'Host worker\n HostName worker.internal\n')
+        effective = 'hostname worker.internal\nport 2222\nuser job\nhostkeyalias pinned\nidentityfile /keys/%h\nidentityfile /keys/static\nchanneltimeout session=1m\n'
+        self.enterContext(mock.patch.object(tw.subprocess, 'check_output', return_value=effective))
+        dns = self.enterContext(mock.patch.object(tw.socket, 'getaddrinfo', return_value=[(0, 0, 0, '', (ip, 2222)) for ip in ('::ffff:100.64.0.3', 'fd7a::1')]))
+        argv = tw.ssh_argv('worker', config)
+        for option in ('-oProxyCommand=none', '-oProxyJump=none', '-oForwardAgent=no', '-oClearAllForwardings=yes', '-oPermitLocalCommand=no',
+                       '-oControlPath=none', '-oControlMaster=no', '-oControlPersist=no', '-oCanonicalizeHostname=no', '-oServerAliveInterval=0',
+                       '-oStrictHostKeyChecking=yes', '-oBatchMode=yes', '-oIdentitiesOnly=yes', '-oPreferredAuthentications=publickey', '-oChannelTimeout=none'):
+            self.assertIn(option, argv)
+        self.assertEqual(argv[-11:], ['-p', '2222', '-l', 'job', '-oHostName=100.64.0.3', '-oHostKeyAlias=pinned',
+                                     '-i', '/keys/worker.internal', '-i', '/keys/static', 'worker'])
+        self.assertEqual(argv[:3], ['ssh', '-F', str(config)])
+        dns.return_value.append((0, 0, 0, '', ('8.8.8.8', 2222)))
+        with self.assertRaisesRegex(ValueError, 'only to private'):
+            tw.ssh_argv('worker')
+        config.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, 'owned private regular'):
+            tw.ssh_argv('worker', config)
+        config.chmod(0o600)
+        config.with_suffix('.link').symlink_to(config)
+        with self.assertRaisesRegex(ValueError, 'without a symlink'):
+            tw.ssh_argv('worker', config.with_suffix('.link'))
+
     def test_resolve_returns_the_selected_approved_machine(self):
         self.enterContext(mock.patch.object(tw, 'output', return_value='{"rootless":true}'))
         machine = dict(name='worker', host='tw-worker', kind='dedicated', online=True,

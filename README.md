@@ -5,7 +5,7 @@ Run Jobs and Services. Projects own their workloads and queues; tailworker owns
 resource lifecycle and discovery. Linux jobs use rootless Podman; Cloud Run
 provides its own runtime. This repository is private.
 
-Commands: `setup`, `ls`, `run`, `image send`, owner-only `up gcp`/`down`, and
+Commands: `setup`, `ls`, `resolve`, `ssh-argv`, `run`, `image send`, owner-only `up gcp`/`down`, and
 `job`/`service` operations. Execution never creates a resource automatically.
 
 ## Install an owned machine
@@ -51,6 +51,18 @@ Use the logical name with `--on`; use its `host` alias with SSH.
 `host` alias and capacity. Consumers use this for enrollment without guessing IPs.
 Its `runtime` gives rootless status, resolved cache/container storage paths and
 their live `cache_free_bytes`/`graph_free_bytes`, for the caller's storage policy.
+
+`ssh-argv DEST [--config FILE] [--null]` returns the base OpenSSH argv as JSON,
+or NUL-terminated UTF-8 arguments for Bash consumers. It needs no discovery,
+Podman or tailworker configuration. All DNS answers must be private, loopback
+or tailnet addresses; the connection pins the checked IP while retaining the
+owner's host-key alias, user, port and identity files. Proxy/jump connections,
+forwarding, local/remote configured commands and multiplexing are disabled.
+The optional configuration must be an owned private regular POSIX file, without
+a symlink; native Windows callers use their existing OpenSSH configuration.
+Consumers append their quoted remote command; tailworker's own SSH calls use
+this same policy. Connection setup has one attempt and a five-second limit;
+submitted work has no deadline or retry.
 
 ```sh
 tailworker image send IMAGE --to MACHINE
@@ -215,41 +227,16 @@ tailnet node; later connections check it strictly. Stale identities, unexpected
 tags and a different bootstrap revision fail. Startup resumes its persisted
 tailnet identity on reboot and logs out at shutdown.
 
-Repeat `--deploy-key OWNER/REPO` to generate private keys on the worker and
-register only their public halves read-only through GitHub's HTTPS REST API.
-Only this optional automation needs an owner API token. Save one plain token
-in the control host's `~/.config/tailworker/github-token` (or the corresponding
-XDG config directory), owned by the caller with mode 0600. Create/edit the file
-privately outside Git; never put its value in argv, environment or a job.
-A fine-grained personal token needs repository Administration (write), which
-includes the read permission to list keys, for only the repositories supplied
-to `--deploy-key`; Metadata (read) is implicit. See
-[GitHub's deploy-key permissions](https://docs.github.com/en/rest/deploy-keys/deploy-keys).
-The token stays on the control host and never reaches a worker. Ordinary jobs
-and public-dependency workers need no GitHub administration credential. Private
-fetch credentials can also be provisioned separately, with the public key
-registered manually in the provider's browser UI, without this API automation.
-Read-only source tokens belong to the consuming project's fetch secrets and
-are separate from this optional Administration token. A source token cannot
-perform these deploy-key administration operations.
-`--deploy-dir` selects their private directory and `--deploy-base` selects the
-paths consumers see inside their secret mount; for example, ci-buddy uses
-`.ci-buddy/projects/<project>/secrets` and `/run/secrets`. GitHub host keys come
-from its HTTPS metadata API. Private halves stay on the worker.
+Private-source access belongs to the consumer's fetch credentials. Use its
+read-only source token or manually provisioned project SSH key. tailworker
+never registers deploy keys or requires repository Administration credentials.
 
-`down` removes only deploy keys with the exact `tw-NAME` title in the explicit
-`tw-deploy-repos` repository scope recorded by `up`, and deletes the labelled VM. Its root
-shutdown unit logs out; the job account has no Tailscale administration.
-The control host must observe the named node absent before cleanup succeeds
-and its alias is removed; an offline node still counts as present. A recorded
-empty repository scope needs no GitHub credential. Key lists follow GitHub's
-[native pagination links](https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api).
-Missing scope, an expired VM whose metadata is gone, or inadequate API authority
-leaves key cleanup explicitly unverified; no account-wide discovery or deletion
-is attempted. The owned VM is still deleted, and the owner checks any remaining
-keys manually. Failed cleanup names what remains; no action is retried. VM deletion at the hard lifetime is
-enforced by the provider. Creation failures leave the
-possible VM for explicit owner inspection rather than guessing and deleting it.
+`down` deletes only the named labelled VM. Its root shutdown unit logs out;
+the job account has no Tailscale administration. The control host must observe
+the named node absent before cleanup succeeds and its alias is removed; an
+offline node still counts as present. Failed cleanup names what remains and
+is never retried. Google enforces the VM's hard lifetime. Creation failures
+leave the possible VM for explicit owner inspection.
 
 ## GPU contract
 
@@ -277,7 +264,7 @@ Every project uses these machines through the layer that matches its jobs:
 Projects create no machines or network identities themselves. They supply their
 own container images, honor the GPU lock, keep credentials in their own secret
 slots and state which machines may receive their data. Application runner seeds
-remain on their machine. Private repositories use read-only worker deploy keys.
+remain on their machine. Private repositories use the consumer's fetch-only credentials.
 One dedicated machine may host several consumers at once; the GPU lock prevents
 collisions while each consumer retains its own queue and credentials.
 
@@ -289,7 +276,7 @@ the scoped OAuth client. Owned machines retain their existing identities.
 ## Trust and owner steps
 
 The owner alone creates/deletes cloud machines, installs root bootstrap,
-changes tailnet rules, creates OAuth clients and deploy keys, and enrolls real
+changes tailnet rules, creates OAuth clients and enrolls real
 production credentials. `policy.hujson` is the policy fragment to merge into
 the existing tailnet; its deny tests must pass in the admin console. Grants
 are additive: never weaken a test to accommodate a broad existing rule.
@@ -308,7 +295,7 @@ host cannot attack its network. Enabling `--net` on an owned host uses that
 host's current network policy.
 
 Before production adoption the owner prepares the GPU locks, merges and tests
-the tailnet policy, supplies scoped OAuth/Google/GitHub credentials outside
+the tailnet policy, supplies scoped OAuth/Google credentials outside
 jobs, and performs the approved one-instance cloud check. Same-machine and
 offline tests do not establish cross-machine isolation. No cloud has been
 activated by fixture tests. The actual provider/network check remains an owner

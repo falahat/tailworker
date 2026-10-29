@@ -21,7 +21,6 @@ import shutil
 import socket
 import stat
 import subprocess
-import sys
 import tarfile
 import tempfile
 import time
@@ -35,13 +34,49 @@ HOME = Path.home()
 CONFIG = Path(os.environ.get('XDG_CONFIG_HOME', HOME / '.config')) / 'tailworker'
 CACHE = Path(os.environ.get('XDG_CACHE_HOME', HOME / '.cache')) / 'tailworker'
 LOCKS = '/var/lib/tailworker/locks'
-SSH = ['ssh', '-T', '-x', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
-       '-o', 'ForwardAgent=no', '-o', 'ClearAllForwardings=yes', '-o', 'PermitLocalCommand=no',
-       '-o', 'ConnectTimeout=5', '-o', 'ConnectionAttempts=1']
+SSH_OPTIONS = ['-T', '-x', '-oBatchMode=yes', '-oStrictHostKeyChecking=yes', '-oPreferredAuthentications=publickey',
+               '-oIdentitiesOnly=yes', '-oForwardAgent=no', '-oClearAllForwardings=yes', '-oPermitLocalCommand=no',
+               '-oProxyCommand=none', '-oProxyJump=none', '-oRemoteCommand=none', '-oTunnel=no', '-oControlPath=none', '-oControlMaster=no',
+               '-oControlPersist=no', '-oCanonicalizeHostname=no', '-oServerAliveInterval=0',
+               '-oConnectTimeout=5', '-oConnectionAttempts=1']
+PRIVATE_NETWORKS = tuple(map(ipaddress.ip_network, ('127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12',
+                                                  '192.168.0.0/16', '100.64.0.0/10', '::1/128', 'fc00::/7')))
+
+
+def owned_private(path):
+    info = path.lstat()
+    uid = os.getuid() if hasattr(os, 'getuid') else None
+    if uid is None or not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_mode & 0o077:
+        raise ValueError('file must be an owned private regular file without a symlink; POSIX ownership is required')
+    return path
+
+
+def ssh_argv(destination, config=None):
+    if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', destination):
+        raise ValueError('invalid SSH destination')
+    selected = ['-F', str(owned_private(Path(config).expanduser()).resolve())] if config else []
+    effective = subprocess.check_output(['ssh', *selected, '-G', *SSH_OPTIONS, destination], text=True)
+    fields = [line.split(' ', 1) for line in effective.splitlines() if ' ' in line]
+    settings = dict(fields)
+    overrides = ['-o' + key + '=' + value for key, value in (('ChannelTimeout', 'none'), ('ForkAfterAuthentication', 'no'), ('StdinNull', 'no'))
+                 if key.lower() in settings]
+    hostname, port = settings['hostname'], int(settings['port'])
+    if not 0 < port < 65536:
+        raise ValueError('invalid SSH port')
+    addresses = [ipaddress.ip_address(row[4][0]) for row in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)]
+    addresses = [getattr(address, 'ipv4_mapped', None) or address for address in addresses]
+    if not addresses or any(not any(address in network for network in PRIVATE_NETWORKS) for address in addresses):
+        raise ValueError('destination must resolve only to private addresses')
+    address = next((address for address in addresses if address.version == 4), addresses[0])
+    alias = settings.get('hostkeyalias', hostname)
+    identities = [part for key, value in fields if key == 'identityfile' for part in ('-i', value.replace('%h', hostname))]
+    return ['ssh', *selected, *SSH_OPTIONS, *overrides, '-p', str(port), '-l', settings['user'],
+            '-oHostName=' + str(address), '-oHostKeyAlias=' + (hostname if alias == 'none' else alias),
+            *identities, destination]
 
 
 def command(host, args):
-    return list(args) if host == 'local' else SSH + [host, shlex.join(args)]
+    return list(args) if host == 'local' else ssh_argv(host) + [shlex.join(args)]
 
 
 def call(host, args, **options):
@@ -400,38 +435,20 @@ def image_send(args):
         raise ValueError('transferred image identity differs')
 
 
-def api(url, value=None, token=None, form=False, method=None):
-    body = (urllib.parse.urlencode(value).encode() if form else json.dumps(value).encode()) if value is not None else None
+def api(url, value, token=None, form=False):
+    body = urllib.parse.urlencode(value).encode() if form else json.dumps(value).encode()
     headers = {'Content-Type': 'application/x-www-form-urlencoded' if form else 'application/json', 'User-Agent': 'tailworker'}
     if token:
         headers['Authorization'] = 'Bearer ' + token
-    origin, result = urllib.parse.urlsplit(url)[:2], []
     try:
-        while True:
-            with urllib.request.urlopen(urllib.request.Request(url, data=body, headers=headers, method=method)) as response:
-                value = None if response.status == 204 else json.load(response)
-                if not isinstance(value, list):
-                    return value
-                result.extend(value)
-                link = re.search(r'<([^>]+)>;\s*rel="next"', response.headers.get('Link', ''))
-                if not link:
-                    return result
-                url = link.group(1)
-                if urllib.parse.urlsplit(url)[:2] != origin:
-                    raise ValueError('provider pagination changed origin')
+        with urllib.request.urlopen(urllib.request.Request(url, data=body, headers=headers)) as response:
+            return json.load(response)
     except urllib.error.HTTPError as error:
         raise ValueError('provider request failed with HTTP ' + str(error.code)) from None
 
 
-def private(name, token=False):
-    path = CONFIG / name
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise ValueError('credentials require an owned private regular file')
-    value = path.read_text().strip()
-    if token and not re.fullmatch(r'[A-Za-z0-9_]+', value):
-        raise ValueError('token file must contain one plain token')
-    return value
+def private(name):
+    return owned_private(CONFIG / name).read_text().strip()
 
 
 def join_key(tags):
@@ -459,51 +476,9 @@ def gcloud(config, *arguments):
     return ['gcloud', '--quiet', '--project=' + config['gcp']['project'], 'compute', *arguments]
 
 
-DEPLOY = '''import hashlib,json,pathlib,shlex,subprocess,sys
-value=json.load(sys.stdin)
-folder=pathlib.Path(value['directory']).expanduser()
-folder.mkdir(mode=0o700,parents=True,exist_ok=True)
-folder.chmod(0o700)
-(folder/'ssh').mkdir(mode=0o700,exist_ok=True)
-base=value['base'] or str(folder)
-blocks=[]
-rewrites=['[core]\\n sshCommand = '+json.dumps('ssh -F '+shlex.quote(base+'/ssh/config'))+'\\n']
-for repo in value['repos']:
-    name='key-'+hashlib.sha256(repo.encode()).hexdigest()[:16]
-    key=folder/name
-    subprocess.run(['ssh-keygen','-q','-t','ed25519','-N','','-f',str(key)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    key.chmod(0o600)
-    blocks.append('Host tw-'+name+'\\n HostName github.com\\n User git\\n IdentitiesOnly yes\\n StrictHostKeyChecking yes\\n IdentityFile '+json.dumps(base+'/'+name)+'\\n UserKnownHostsFile '+json.dumps(base+'/ssh/known_hosts')+'\\n')
-    rewrites.append('[url "ssh://git@tw-'+name+'/'+repo+'"]\\n'+''.join(' insteadOf = '+address+repo+'\\n' for address in ('https://github.com/','git@github.com:','ssh://git@github.com/')))
-    print(json.dumps(dict(repo=repo,public=key.with_suffix('.pub').read_text().strip())),flush=True)
-(folder/'ssh/config').write_text(''.join(blocks))
-(folder/'ssh/known_hosts').write_text(''.join('github.com '+key+'\\n' for key in value['host_keys']))
-(folder/'gitconfig').write_text(''.join(rewrites))
-for path in (folder/'ssh/config',folder/'ssh/known_hosts',folder/'gitconfig'):path.chmod(0o600)
-'''
-
-
-def deploy_keys(alias, args):
-    if not args.deploy_key:
-        return
-    token = private('github-token', token=True)
-    host_keys = api('https://api.github.com/meta')['ssh_keys']
-    value = dict(repos=args.deploy_key, directory=args.deploy_dir, base=args.deploy_base, host_keys=host_keys)
-    result = subprocess.check_output(command(alias, ['python3', '-c', DEPLOY]), input=json.dumps(value).encode())
-    returned = [json.loads(line) for line in result.decode().splitlines()]
-    if [key['repo'] for key in returned] != args.deploy_key:
-        raise ValueError('worker returned unexpected deploy-key identities')
-    for key in returned:
-        if not re.fullmatch(r'ssh-ed25519 [A-Za-z0-9+/]+={0,3}(?: [^\r\n]*)?', key['public']):
-            raise ValueError('worker returned an invalid public deploy key')
-        api('https://api.github.com/repos/' + key['repo'] + '/keys', dict(title=alias, key=key['public'], read_only=True), token)
-
-
 def up(args, config):
     if not 1 <= args.hours <= 24 or args.disk_gb <= 0 or not re.fullmatch(r'[a-z](?:[a-z0-9-]{0,58}[a-z0-9])?', args.name):
         raise ValueError('use a valid name and a hard lifetime from 1 through 24 hours')
-    if any(not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo) for repo in args.deploy_key):
-        raise ValueError('deploy keys require OWNER/REPO names')
     tags = sorted(set(['tag:tw', *args.tag]))
     if any(not re.fullmatch(r'tag:[a-z0-9-]+', tag) for tag in tags):
         raise ValueError('provide native worker tags')
@@ -538,7 +513,7 @@ def up(args, config):
             '--instance-termination-action=DELETE', '--image-family=' + cloud[family], '--image-project=' + cloud[project],
             '--boot-disk-size=' + str(args.disk_gb), '--labels=tailworker=1',
             '--metadata=block-project-ssh-keys=TRUE,enable-oslogin=FALSE,tw-name=' + alias + ',tw-tags=' + ' '.join(tags) +
-            ',tw-allow=' + ' '.join(allowed) + ',tw-expires-at=' + expires + ',tw-deploy-repos=' + ' '.join(args.deploy_key),
+            ',tw-allow=' + ' '.join(allowed) + ',tw-expires-at=' + expires,
             '--metadata-from-file=startup-script=' + str(startup) + ',tw-authkey=' + str(auth) + ',tw-authorized-keys=' + str(keys))
         if args.spot:
             creation.append('--provisioning-model=SPOT')
@@ -547,8 +522,6 @@ def up(args, config):
         if args.dry_run:
             print(shlex.join(creation))
             return
-        if args.deploy_key:
-            private('github-token', token=True)
         call('local', ['git', '-C', str(Path(__file__).resolve().parent), 'diff', '--quiet', 'HEAD'])
         if json.loads(subprocess.check_output(gcloud(config, 'instances', 'list', '--filter=labels.tailworker=1', '--format=json'))):
             raise ValueError('a labelled worker instance already exists; inspect it first')
@@ -595,7 +568,6 @@ def up(args, config):
             raise ValueError('private worker SSH failed; no command was retried')
         print('Waiting for ' + alias + ' bootstrap', flush=True)
         time.sleep(1)
-    deploy_keys(alias, args)
     print('ssh ' + alias + '; expires ' + expires)
 
 
@@ -607,20 +579,6 @@ def down(args, config):
     if any(item['name'] != alias or item.get('labels', {}).get('tailworker') != '1' for item in instances):
         raise ValueError('refusing to remove an instance not owned by tailworker')
     # The root shutdown unit logs out; the job account never administers tailscaled.
-    try:
-        metadata = {entry['key']: entry['value'] for item in instances for entry in item.get('metadata', {}).get('items', [])}
-        repositories = metadata['tw-deploy-repos'].split()
-        if repositories:
-            token = private('github-token', token=True)
-            for repo in repositories:
-                if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
-                    raise ValueError('invalid repository identity')
-                for key in api('https://api.github.com/repos/' + repo + '/keys?per_page=100', token=token):
-                    if key['title'] == alias:
-                        api('https://api.github.com/repos/' + repo + '/keys/' + str(int(key['id'])), token=token, method='DELETE')
-    except (OSError, ValueError, KeyError, AttributeError, TypeError):
-        failed = True
-        print(alias + ' deploy-key cleanup authority is unverified; continuing VM cleanup', file=sys.stderr)
     for item in instances:
         step = gcloud(config, 'instances', 'delete', alias, '--zone=' + item['zone'].rsplit('/', 1)[-1])
         result = subprocess.run(step, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -635,7 +593,7 @@ def down(args, config):
         print(alias + ' node removal is not independently confirmed; inspect tailnet status', file=sys.stderr)
         failed = True
     if failed:
-        raise ValueError(alias + ' cleanup is incomplete; inspect the instance, node and deploy keys')
+        raise ValueError(alias + ' cleanup is incomplete; inspect the instance and node')
     known = CONFIG / 'known_hosts'
     pins = known.read_text() if known.exists() else ''
     save(known, ''.join(line + '\n' for line in pins.splitlines() if not line.startswith(alias + ' ')))
@@ -652,6 +610,10 @@ def main():
     commands.add_parser('setup')
     commands.add_parser('ls').add_argument('--json', action='store_true')
     commands.add_parser('resolve').add_argument('name')
+    transport = commands.add_parser('ssh-argv')
+    transport.add_argument('destination')
+    transport.add_argument('--config', type=Path)
+    transport.add_argument('--null', action='store_true')
     run_parser = commands.add_parser('run')
     run_parser.add_argument('--on')
     run_parser.add_argument('--gpu', action='store_true')
@@ -675,10 +637,8 @@ def main():
         create.add_argument('--' + flag, action='store_true')
     create.add_argument('--machine-type')
     create.add_argument('--disk-gb', type=int, default=200)
-    for flag in ('tag', 'allow', 'deploy-key'):
+    for flag in ('tag', 'allow'):
         create.add_argument('--' + flag, action='append', default=[])
-    create.add_argument('--deploy-dir', default='~/.config/tailworker/github')
-    create.add_argument('--deploy-base')
     commands.add_parser('down').add_argument('name')
     args = parser.parse_args()
     if args.action == 'setup':
@@ -689,6 +649,12 @@ def main():
         machine = choose(args.name)
         machine['runtime'] = runtime(machine)
         print(json.dumps(machine))
+    elif args.action == 'ssh-argv':
+        argv = ssh_argv(args.destination, args.config)
+        if args.null:
+            sys.stdout.buffer.write(('\0'.join(argv) + '\0').encode())
+        else:
+            print(json.dumps(argv))
     elif args.action == 'run':
         args.command = args.command[1:] if args.command[:1] == ['--'] else args.command
         return run(args)

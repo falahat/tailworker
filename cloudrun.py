@@ -11,6 +11,12 @@ import time
 import tomllib
 import urllib.request
 
+JOB_EXECUTION = dict(taskCount=1, parallelism=1)
+JOB_TASK = dict(maxRetries=0)
+SERVICE_ANNOTATIONS = {'run.googleapis.com/ingress': 'internal', 'run.googleapis.com/invoker-iam-disabled': 'false',
+                       'run.googleapis.com/maxScale': '1', 'run.googleapis.com/minScale': '0'}
+REVISION_ANNOTATIONS = {'autoscaling.knative.dev/maxScale': '1', 'autoscaling.knative.dev/minScale': '0'}
+
 
 def configuration():
     root = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'tailworker'
@@ -94,15 +100,13 @@ def manifest(args, policy):
     resource = dict(apiVersion='run.googleapis.com/v1', kind='Job',
                     metadata=dict(name=name(args.name), labels=dict(tailworker='1')))
     if args.kind == 'job':
-        spec['maxRetries'] = 0
+        spec.update(JOB_TASK)
         resource['spec'] = dict(template=dict(metadata=metadata,
-            spec=dict(taskCount=1, parallelism=1, template=dict(spec=spec))))
+            spec=dict(**JOB_EXECUTION, template=dict(spec=spec))))
     else:
         resource.update(apiVersion='serving.knative.dev/v1', kind='Service')
-        resource['metadata']['annotations'] = {'run.googleapis.com/ingress': 'internal',
-            'run.googleapis.com/invoker-iam-disabled': 'false', 'run.googleapis.com/maxScale': '1',
-            'run.googleapis.com/minScale': '0'}
-        annotations.update({'autoscaling.knative.dev/maxScale': '1', 'autoscaling.knative.dev/minScale': '0'})
+        resource['metadata']['annotations'] = dict(SERVICE_ANNOTATIONS)
+        annotations.update(REVISION_ANNOTATIONS)
         resource['spec'] = dict(template=dict(metadata=metadata, spec=spec))
     return resource
 
@@ -125,13 +129,15 @@ def protected(cloud, policy, kind, resource):
     if kind == 'job':
         execution = pod
         pod = execution['template']['spec']
-        if execution.get('taskCount') != 1 or execution.get('parallelism') != 1 or pod.get('maxRetries') != 0:
+        if not JOB_EXECUTION.items() <= execution.items() or not JOB_TASK.items() <= pod.items():
             raise ValueError('job must have one task, one parallel instance and no retries')
     else:
-        settings = resource['metadata'].get('annotations', {})
-        if settings.get('run.googleapis.com/ingress') != 'internal' or settings.get('run.googleapis.com/invoker-iam-disabled', 'false') != 'false':
+        settings = {'run.googleapis.com/invoker-iam-disabled': 'false', 'run.googleapis.com/minScale': '0',
+                    **resource['metadata'].get('annotations', {})}
+        if not SERVICE_ANNOTATIONS.items() <= settings.items():
             raise ValueError('service must require private ingress and IAM')
-        if settings.get('run.googleapis.com/maxScale') != '1' or template['metadata']['annotations'].get('autoscaling.knative.dev/maxScale') != '1':
+        revision = {'autoscaling.knative.dev/minScale': '0', **template['metadata']['annotations']}
+        if not REVISION_ANNOTATIONS.items() <= revision.items():
             raise ValueError('service must be limited to one instance')
     if pod['serviceAccountName'] != policy['service_account']:
         raise ValueError('resource service identity differs from owner configuration')
@@ -242,15 +248,15 @@ def execute(cloud, policy, args):
         return [descriptor(cloud, args.kind, item) for item in discover(cloud, args.kind)]
     value = name(args.name)
     resource = discover(cloud, args.kind, value)[0]
-    if args.action == 'describe':
+    if args.action not in ('delete', 'logs'):
         protected(cloud, policy, args.kind, resource)
+    if args.action == 'describe':
         return descriptor(cloud, args.kind, resource)
     if args.action == 'delete':
         sdk(cloud, args.kind + 's', 'delete', value)
         return dict(deleted=reference(cloud, args.kind, value))
     if args.action == 'logs':
         return sdk(cloud, args.kind + 's', 'logs', 'read', value, '--limit=100')
-    protected(cloud, policy, args.kind, resource)
     if args.kind == 'service':
         return invoke(cloud, policy, args, descriptor(cloud, args.kind, resource))
     executions = sdk(cloud, 'jobs', 'executions', 'list', '--job=' + value)
