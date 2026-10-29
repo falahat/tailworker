@@ -123,6 +123,7 @@ class Core(unittest.TestCase):
             with mock.patch.object(tw.os,'name','nt'), mock.patch.object(tw.shutil,'which',return_value=installed), mock.patch.object(tw.subprocess,'run') as acl:
                 self.assertEqual(tw.profile(path)['machines'],['worker'])
                 self.assertEqual(acl.call_args.args[0][0],expected)
+                self.assertEqual(acl.call_args.kwargs['stdin'],subprocess.DEVNULL)
         for change in ('[env]\nTAILWORKER_MANAGED="1"\n','unexpected=true\n'):
             path.write_text(value+change)
             with self.assertRaises(ValueError):
@@ -192,6 +193,7 @@ class Core(unittest.TestCase):
             launch.return_value.wait.return_value=23
             self.assertEqual(tw.run(args),23)
         self.assertEqual([call.args[0] for call in probe.call_args_list],['first','second'])
+        self.assertTrue(all(call.kwargs['stdin']==subprocess.DEVNULL for call in probe.call_args_list))
         launch.assert_called_once()
         self.assertEqual(launch.call_args.args[0][0],'second')
 

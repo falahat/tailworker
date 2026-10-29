@@ -52,7 +52,7 @@ def ssh_argv(destination, config=None):
     if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', destination):
         raise ValueError('invalid SSH destination')
     selected = ['-F', str(owned_private(Path(config).expanduser()).resolve())] if config else []
-    effective = subprocess.check_output(['ssh', *selected, '-G', *SSH_OPTIONS, destination], text=True)
+    effective = subprocess.check_output(['ssh', *selected, '-G', *SSH_OPTIONS, destination], text=True, stdin=subprocess.DEVNULL)
     fields = [line.split(' ', 1) for line in effective.splitlines() if ' ' in line]
     settings = dict(fields)
     overrides = ['-o' + key + '=' + value for key, value in (('ChannelTimeout', 'none'), ('ForkAfterAuthentication', 'no'), ('StdinNull', 'no'))
@@ -81,7 +81,7 @@ def call(host, args, **options):
 
 
 def output(host, args):
-    return subprocess.check_output(command(host, args), text=True, stderr=subprocess.DEVNULL).strip()
+    return subprocess.check_output(command(host, args), text=True, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL).strip()
 
 
 def save(path, value):
@@ -132,7 +132,7 @@ def setup():
 
 def machines(config):
     result = [dict(name=name, host=host, kind='owned', online=True) for name, host in config['owned'].items()]
-    state = json.loads(subprocess.check_output(['tailscale', 'status', '--json'], text=True))
+    state = json.loads(subprocess.check_output(['tailscale', 'status', '--json'], text=True, stdin=subprocess.DEVNULL))
     for node in sorted(state.get('Peer', {}).values(), key=lambda node: node['HostName']):
         if 'tag:tw' not in node.get('Tags', []):
             continue
@@ -212,7 +212,7 @@ def choose(name=None, gpu=False):
 
 def runtime(machine):
     script = '''import json,os,pathlib,shutil,subprocess
-info = json.loads(subprocess.check_output(['podman','info','--format','json']))
+info = json.loads(subprocess.check_output(['podman','info','--format','json'],stdin=subprocess.DEVNULL))
 cache = pathlib.Path(os.environ.get('XDG_CACHE_HOME',pathlib.Path.home()/'.cache'))/'tailworker'
 cache.mkdir(mode=0o700,parents=True,exist_ok=True)
 graph = str(pathlib.Path(info['store']['graphRoot']).resolve())
@@ -246,7 +246,7 @@ def profile(path):
         script += "$stop='" + str(CONFIG.parent).replace("'", "''") + "';$ok=@($me,'S-1-5-18','S-1-5-32-544');while($p){$a=Get-Acl -LiteralPath $p;if($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $ok){exit 1};"
         script += "foreach($r in $a.Access){if($r.AccessControlType -eq 'Allow' -and ([int]$r.FileSystemRights -band 852310) -and $r.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -notin $ok){exit 1}};if($p -eq $stop){break};$p=Split-Path -Parent $p}"
         subprocess.run([shutil.which('pwsh') or 'powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand',
-                        base64.b64encode(script.encode('utf-16le')).decode()], check=True, stdout=subprocess.DEVNULL)
+                        base64.b64encode(script.encode('utf-16le')).decode()], check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     else:
         for item in (path, *path.parents):
             if item.stat().st_uid != os.getuid() or item.stat().st_mode & 0o022:
@@ -284,10 +284,10 @@ def profile(path):
 EXEC = r'''import fcntl,json,os,pathlib,signal,shutil,subprocess,sys
 os.umask(0o077)
 p, identifier, mode = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3]
-info = json.loads(subprocess.check_output(['podman','info','--format','json']))
+info = json.loads(subprocess.check_output(['podman','info','--format','json'],stdin=subprocess.DEVNULL))
 if not info['host']['security']['rootless'] or p['cpus'] > os.cpu_count() or p['memory_bytes'] > os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE'):
     raise ValueError('worker lacks rootless Podman or requested resources')
-image = subprocess.check_output(['podman','image','inspect','--format','{{.Id}}',p['image']],text=True).strip()
+image = subprocess.check_output(['podman','image','inspect','--format','{{.Id}}',p['image']],text=True,stdin=subprocess.DEVNULL).strip()
 if 'sha256:' + image.removeprefix('sha256:') != p['image']:
     raise ValueError('approved image is unavailable')
 if p.get('gpu') and not json.loads(pathlib.Path('/var/lib/tailworker/capacity.json').read_text())['gpu_name']:
@@ -393,7 +393,7 @@ def run(args):
             continue
         invocation = ['python3','-c',EXEC,json.dumps(value),identifier]
         try:
-            call(machine['host'], [*invocation,'check'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            call(machine['host'], [*invocation,'check'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             break
         except subprocess.CalledProcessError:
             continue
@@ -462,7 +462,7 @@ def join_key(tags):
 
 
 def nodes():
-    state = json.loads(subprocess.check_output(['tailscale', 'status', '--json'], text=True))
+    state = json.loads(subprocess.check_output(['tailscale', 'status', '--json'], text=True, stdin=subprocess.DEVNULL))
     return [state['Self'], *state.get('Peer', {}).values()]
 
 
