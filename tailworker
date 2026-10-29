@@ -367,7 +367,7 @@ sys.exit(result)
 '''
 
 
-CANCEL = '''import os,pathlib,signal,sys
+CANCEL = r'''import os,pathlib,signal,sys
 base = pathlib.Path(os.environ.get('XDG_RUNTIME_DIR',pathlib.Path.home()/'.local/state'))/'tailworker'
 base.mkdir(mode=0o700,parents=True,exist_ok=True)
 (base/(sys.argv[1]+'.cancel')).touch()
