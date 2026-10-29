@@ -299,6 +299,7 @@ protected = [pathlib.Path(item) for item in ('/etc','/proc','/sys','/dev','/run'
 protected += [home/'.ssh',home/'.aws',home/'.kube',home/'.config',home/'.local/share/containers',
               pathlib.Path(os.environ.get('XDG_CONFIG_HOME',home/'.config'))/'tailworker',control,graph]
 flags = ['--rm','--interactive','--name',identifier,'--pull=never','--userns=keep-id',
+         '--user',str(os.getuid())+':'+str(os.getgid()),
          '--cpus',str(p['cpus']),'--memory',str(p['memory_bytes']),'--memory-swap',str(p['memory_bytes']),
          '--read-only','--cap-drop=all','--security-opt=no-new-privileges','--network=none',
          '--tmpfs','/tmp:rw,nosuid,nodev,size=1g','--tmpfs','/run:rw,nosuid,nodev,size=64m','--workdir',p['workdir']]

@@ -122,6 +122,8 @@ exist: `image send` compares image IDs and transfers only missing images using
 `podman save | zstd | ssh | podman load`, using only rootless Podman.
 
 Execution preserves stdin, stdout, stderr and the container's exit status.
+The container explicitly runs as the host's numeric UID:GID inside its keep-id
+namespace, regardless of the image's USER, so private mounts keep their modes.
 Every run uses a read-only root, no network, dropped capabilities,
 no-new-privileges, private mount propagation, bounded CPU/memory (including
 swap), and writable temporary filesystems. GPU runs wait for the canonical

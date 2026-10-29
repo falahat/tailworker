@@ -145,6 +145,7 @@ class Core(unittest.TestCase):
         for item in ('--interactive','--cpus','--memory','--memory-swap','--read-only','--cap-drop=all','--security-opt=no-new-privileges','--network=none','--pull=never','TAILWORKER_MANAGED=1',str(self.root/'data')+':/work:rw,rprivate,nosuid,nodev'):
             self.assertIn(item,args)
         self.assertEqual(args[-4:],[value['image'],'sh','-c','exit 23'])
+        self.assertEqual(args[args.index('--user')+1],str(os.getuid())+':'+str(os.getgid()))
         with mock.patch.dict(os.environ,FAKE_EXIT='23'):
             result = subprocess.run([sys.executable,'-c',tw.EXEC,json.dumps(value),'tw-own','run','true'],input=b'x',stdout=subprocess.PIPE)
         self.assertEqual(result.returncode,23)
