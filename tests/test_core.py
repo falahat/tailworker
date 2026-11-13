@@ -185,6 +185,71 @@ class Core(unittest.TestCase):
                 process.terminate()
             process.wait()
 
+    def test_declared_gpu_memory_shares_the_lock_and_exclusive_jobs_wait(self):
+        value = self.environment(gpu=True)
+        gib = 2**30
+        (self.root/'capacity.json').write_text(json.dumps(dict(gpu_name='admitted', gpu_memory_bytes=8*gib)))
+        locks = self.root/'locks'
+        locks.mkdir()
+        for name in ('gpu','gpu.want'):
+            (locks/name).touch()
+        smi = self.root/'bin'/'nvidia-smi'
+        smi.write_text('#!'+sys.executable+'\nimport os,sys\nif "--query-gpu=memory.used" in sys.argv: print(os.environ.get("FAKE_GPU_USED","0"))\n')
+        smi.chmod(0o700)
+        self.enterContext(mock.patch.dict(os.environ, HOME=str(self.root/'home'), FAKE_GPU_USED='2048'))
+        script = tw.EXEC.replace('/var/lib/tailworker/locks',str(locks)).replace('/var/lib/tailworker/capacity.json',str(self.root/'capacity.json'))
+        def start(name, need=None):
+            item = dict(value, gpu_memory_bytes=need) if need else value
+            return subprocess.Popen([sys.executable,'-c',script,json.dumps(item),name,'run','true'],stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        processes = []
+        try:
+            first, second = start('tw-first', gib), start('tw-second', gib)
+            processes += [first, second]
+            for process in (first, second):
+                self.assertEqual(json.loads(process.stdout.readline())['fd'],(locks/'gpu').stat().st_ino)
+            self.assertEqual(len(list((self.root/'home/.local/state/tailworker-gpu').glob('*.json'))),2)
+            with (locks/'gpu').open() as lock:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                fcntl.flock(lock,fcntl.LOCK_SH|fcntl.LOCK_NB)
+            # 2 GiB in use plus 2 GiB admitted but unallocated leaves no room for 5 GiB.
+            large = start('tw-large', 5*gib)
+            processes.append(large)
+            self.assertIn('waiting for',large.stderr.readline())
+            large.send_signal(signal.SIGINT)
+            self.assertEqual(large.wait(),130)
+            exclusive = start('tw-exclusive')
+            processes.append(exclusive)
+            while not (self.root/'runtime/tailworker/tw-exclusive.pid').exists():
+                time.sleep(0.01)
+            time.sleep(0.3)
+            self.assertIsNone(exclusive.poll())
+            for process in (first, second):
+                process.communicate('x')
+                self.assertEqual(process.returncode,0)
+            self.assertEqual(list((self.root/'home/.local/state/tailworker-gpu').glob('*.json')),[])
+            self.assertEqual(json.loads(exclusive.stdout.readline())['fd'],(locks/'gpu').stat().st_ino)
+            exclusive.communicate('x')
+            self.assertEqual(exclusive.returncode,0)
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+
+    def test_profile_accepts_gpu_memory_only_for_gpu_jobs(self):
+        config = self.root / 'config'
+        self.enterContext(mock.patch.object(tw,'CONFIG',config))
+        path = config / 'profiles' / 'worker.toml'
+        base = 'machines=["worker"]\nimage="sha256:'+'a'*64+'"\ncpus=1\nmemory_bytes=1024\nmin_free_bytes=1\nworkdir="/work"\nmounts=[]\n'
+        tw.save(path, base+'gpu=true\ngpu_memory_bytes=1024\n')
+        self.assertEqual(tw.profile(path)['gpu_memory_bytes'],1024)
+        for change in ('gpu_memory_bytes=1024\n','gpu=true\ngpu_memory_bytes=0\n','gpu=true\ngpu_memory_bytes="1"\n'):
+            path.write_text(base+change)
+            with self.assertRaises(ValueError):
+                tw.profile(path)
+
     def test_only_approved_machines_are_probed_and_execution_is_never_retried(self):
         value = dict(machines=['offline','first','second'],gpu=False)
         found = [dict(name=name,host=name,online=capacity is not None) for name,capacity in

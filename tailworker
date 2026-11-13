@@ -255,7 +255,7 @@ def profile(path):
                 break
     value = tomllib.loads(path.read_text())
     required = {'machines', 'image', 'cpus', 'memory_bytes', 'min_free_bytes', 'workdir', 'mounts'}
-    if not required <= value.keys() or value.keys() - required - {'gpu', 'env'}:
+    if not required <= value.keys() or value.keys() - required - {'gpu', 'gpu_memory_bytes', 'env'}:
         raise ValueError('profile has missing or unknown settings')
     if not isinstance(value['machines'], list) or not value['machines'] or any(not isinstance(name, str) or not re.fullmatch('[a-z][a-z0-9-]*', name) for name in value['machines']):
         raise ValueError('profile requires explicit approved machine names')
@@ -263,6 +263,10 @@ def profile(path):
         raise ValueError('profile requires an immutable image and positive resource limits')
     if type(value.get('gpu', False)) is not bool or not isinstance(value.get('env', {}), dict):
         raise ValueError('invalid GPU or environment settings')
+    # A job that declares its GPU memory may share the GPU with other declaring jobs.
+    if 'gpu_memory_bytes' in value and (value.get('gpu') is not True or type(value['gpu_memory_bytes']) is not int
+                                        or value['gpu_memory_bytes'] <= 0):
+        raise ValueError('gpu_memory_bytes requires gpu = true and a positive byte count')
     for key, item in value.get('env', {}).items():
         if not re.fullmatch('[A-Za-z_][A-Za-z0-9_]*', key) or key.startswith('TAILWORKER_') or not isinstance(item, str) or '\0' in item:
             raise ValueError('invalid or reserved public environment setting')
@@ -281,7 +285,7 @@ def profile(path):
     return value
 
 
-EXEC = r'''import fcntl,json,os,pathlib,signal,shutil,subprocess,sys
+EXEC = r'''import fcntl,json,os,pathlib,signal,shutil,subprocess,sys,time
 os.umask(0o077)
 p, identifier, mode = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3]
 info = json.loads(subprocess.check_output(['podman','info','--format','json'],stdin=subprocess.DEVNULL))
@@ -333,11 +337,74 @@ def cancel(*unused):
         raise KeyboardInterrupt
 for sig in (signal.SIGINT,signal.SIGTERM):
     signal.signal(sig,cancel)
+reservation = None
+def gpu_reserved(ledger):
+    # Memory admitted to live sharing jobs but not yet allocated by their containers.
+    apps = {}
+    for line in subprocess.check_output(['nvidia-smi','--query-compute-apps=pid,used_memory','--format=csv,noheader,nounits'],text=True,stdin=subprocess.DEVNULL).splitlines():
+        if line.strip():
+            number, amount = (item.strip() for item in line.split(','))
+            apps[int(number)] = int(amount) * 2**20
+    pending = 0
+    for item in ledger.glob('*.json'):
+        entry = json.loads(item.read_text())
+        try:
+            live = pathlib.Path('/proc',str(entry['pid']),'stat').read_text().rsplit(')',1)[1].split()[19] == entry['start']
+        except (OSError,IndexError):
+            live = False
+        if not live:
+            item.unlink(missing_ok=True)
+            continue
+        container = subprocess.run(['podman','inspect','--format','{{.Id}}',entry['name']],capture_output=True,text=True,stdin=subprocess.DEVNULL).stdout.strip()
+        actual = 0
+        for number, amount in apps.items():
+            try:
+                if container and container in pathlib.Path('/proc',str(number),'cgroup').read_text():
+                    actual += amount
+            except OSError:
+                pass
+        pending += max(0,entry['need'] - actual)
+    return pending
 try:
     pid.write_text(str(os.getpid()))
     if cancelled_file.exists():
         raise KeyboardInterrupt
-    if p.get('gpu',False):
+    if p.get('gpu',False) and 'gpu_memory_bytes' in p:
+        # Shared admission: hold the GPU lock shared, so exclusive jobs still wait for every sharing job and
+        # sharing jobs wait for every exclusive one. Waiting exclusive jobs keep gpu.want and so go first.
+        need, margin = p['gpu_memory_bytes'], 256 * 2**20
+        total = json.loads(pathlib.Path('/var/lib/tailworker/capacity.json').read_text())['gpu_memory_bytes']
+        if need + margin > total:
+            raise ValueError('declared GPU memory exceeds the device')
+        ledger = pathlib.Path.home()/'.local/state/tailworker-gpu'
+        ledger.mkdir(mode=0o700,parents=True,exist_ok=True)
+        start = pathlib.Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()[19]
+        waiting = False
+        while True:
+            want = os.open('/var/lib/tailworker/locks/gpu.want',os.O_RDONLY)
+            fcntl.flock(want,fcntl.LOCK_EX)
+            lease = os.open('/var/lib/tailworker/locks/gpu',os.O_RDONLY)
+            try:
+                fcntl.flock(lease,fcntl.LOCK_SH|fcntl.LOCK_NB)
+                used = sum(int(item) for item in subprocess.check_output(['nvidia-smi','--query-gpu=memory.used','--format=csv,noheader,nounits'],text=True,stdin=subprocess.DEVNULL).split()) * 2**20
+                if used + gpu_reserved(ledger) + need + margin <= total:
+                    reservation = ledger/(identifier+'.json')
+                    reservation.write_text(json.dumps(dict(name=identifier,need=need,pid=os.getpid(),start=start)))
+                    os.close(want)
+                    break
+                fcntl.flock(lease,fcntl.LOCK_UN)
+            except BlockingIOError:
+                pass
+            os.close(lease)
+            os.close(want)
+            if not waiting:
+                print('tailworker: waiting for '+str(need)+' bytes of GPU memory',file=sys.stderr,flush=True)
+                waiting = True
+            time.sleep(5)
+        os.dup2(lease,3,inheritable=True)
+        if lease != 3:
+            os.close(lease)
+    elif p.get('gpu',False):
         want = os.open('/var/lib/tailworker/locks/gpu.want',os.O_RDONLY)
         fcntl.flock(want,fcntl.LOCK_EX)
         lease = os.open('/var/lib/tailworker/locks/gpu',os.O_RDONLY)
@@ -364,6 +431,8 @@ finally:
     signal.signal(signal.SIGTERM,signal.SIG_IGN)
     pid.unlink(missing_ok=True)
     cancelled_file.unlink(missing_ok=True)
+    if reservation:
+        reservation.unlink(missing_ok=True)
 sys.exit(result)
 '''
 
